@@ -12,7 +12,7 @@ The primary source is Morton Gertler’s *A Reanalysis of the Original Test Data
 
 The model will estimate a dimensionless residual-resistance coefficient, whereas a design decision normally requires full-scale total resistance and propulsion power (the coefficient is an effective proxy in early stages).
 
-The original government-authored report was released for public distribution; the report and extracted data will be republished on GitHub. Other compatible test series may be added as time allows.
+The original government-authored report was released for public distribution; the [report](https://archive.org/details/DTIC_AD0224171) is too large to be republished directly, but the extracted data will be republished on GitHub. Other compatible test series may be added as time allows.
 
 ## Decision affected by the model
 
