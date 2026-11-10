@@ -10,6 +10,8 @@ venv/
 
 data/*
 !data/README.md
+!scripts/extract_graph.py
+!scripts/requirements.txt
 
 *.pt
 *.pth
