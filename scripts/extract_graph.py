@@ -1,86 +1,96 @@
-"""
-Automatic, experimental digitizer for a stitched scanned graph.
-
-Run:
-    python scripts/extract_graph.py data/stitched_graph_223_224.png \
-        --output data/points.csv \
-        --overlay data/diagnostics.png
-
-Install Python dependencies:
-    python -m pip install numpy scipy opencv-python pytesseract
-
-Tesseract itself must also be installed.
-
-Grid model:
-* Rotation is estimated from vertical evidence in the right half.
-* Spacing is measured from repeated adjacent vertical lines in the right half.
-* The same spacing is used horizontally and vertically.
-* Horizontal evidence determines only the horizontal grid offset.
-* The generated grid cannot bend along individual curves.
-* Supported line extents can differ between plot sections.
-
-Outputs:
-    diagnostics_expected_grid.png
-        Full generated template, including outside the plot.
-    diagnostics_expected_overlay.png
-        Full generated template in green over the image.
-    diagnostics_grid.png
-        Final exclusion mask.
-    diagnostics.png
-        Exclusion mask in red, plot bounds, and curve traces.
-    diagnostics.json
-        Grid measurements, OCR, calibration, warnings, and errors.
-    points.csv
-        Written only if all detected sections pass implemented checks.
-
-Assumptions:
-* Approximately upright image.
-* One global square-grid spacing and rotation fit both sections.
-* Linear axes.
-* Curves are functions of x and do not cross.
-* Tags descend from top to bottom.
-* Seven curves correspond to 7, 6, ..., 1.
-* Twelve curves correspond to 6.5, 6, ..., 1.
-* If two sections are detected, the left has seven curves and the right twelve.
-
-Limitations:
-* No local geometric dewarping.
-* Detached scientific-notation axis multipliers are not interpreted.
-* Missing grid lines can still cause spacing ambiguity.
-* OCR, bounds detection, and tracing remain experimental.
-* A curve overlapping an actual grid line cannot be separated by geometry alone.
-"""
-
-from __future__ import annotations
-
+from pathlib import Path
+from dataclasses import dataclass
 import argparse
 import csv
-import json
 import math
 import os
 import re
 import shutil
 import sys
-import traceback
-from dataclasses import dataclass
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytesseract
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import find_peaks
+from scipy.interpolate import BSpline
+from scipy.optimize import Bounds, LinearConstraint, minimize
 
 
-@dataclass
-class Panel:
-    left: int
-    top: int
-    right: int
-    bottom: int
+DEFAULT_IMAGE = Path("data/images/graph_223.png")
+DEFAULT_OUTPUT_DIR = Path("data")
+DEFAULT_DIAGNOSTIC_DIR = Path("data/diagnostics")
+
+MINOR_DIVISIONS = 10
+MASK_WIDTH = 3
+MIN_CROSSINGS = 4
+MIN_AXIS_LABELS = 3
+OCR_MIN_CONFIDENCE = 35
+ANCHOR_MIN_CONFIDENCE = 50
+AXIS_SEARCH_PADDING = 70
+BOTTOM_LABEL_BAND_FRACTION = 0.12
+COLUMN_PADDING = 8
+ROW_HALF_HEIGHT_FACTOR = 1.05
+TITLE_PADDING = 3
+LABEL_STEP_TOLERANCE = 0.05
+
+REFERENCE_GRID_WARN_ASPECT_ERROR = 0.05
+REFERENCE_GRID_MAX_ASPECT_ERROR = 0.10
+REFERENCE_GRID_MAX_MEDIAN_LABEL_ERROR = 0.25
+
+DEFAULT_GRID_SEARCH = 12.0
+GRID_MAX_SPACING_FRACTION = 0.45
+GRID_NODE_INTERVALS = 4.0
+GRID_WINDOW_INTERVALS = 6.0
+GRID_MAX_LOCAL_SLOPE = 0.12
+GRID_SLOPE_SAMPLES = 9
+GRID_MIN_SUPPORT = 0.25
+GRID_MIN_CONTRAST = 0.08
+GRID_MIN_PEAK_MARGIN = 0.04
+GRID_ALONG_SMOOTHNESS = 1.0
+GRID_ACROSS_SMOOTHNESS = 0.75
+GRID_REFERENCE_WEIGHT = 0.015
+GRID_CG_ITERATIONS = 250
+
+SPLINE_DEGREE = 3
+SPLINE_BASIS_COUNTS = (8, 12, 16)
+SPLINE_SMOOTHNESS = 0.002
+SPLINE_ROBUST_SCALE = 2.0
+SPLINE_MIN_SEPARATION = 0.10
+SPLINE_ASSIGNMENT_ITERATIONS = 7
+SPLINE_OPTIMIZER_ITERATIONS = 220
+SPLINE_MAX_SAMPLE_COLUMNS = 450
+DEFAULT_SHAPE_WEIGHT = 0.1
+
+ASSIGN_MIN_GATE = 4.0
+ASSIGN_MAX_GATE = 18.0
+ASSIGN_MISSING_COST = 0.8
+OBSERVED_TOLERANCE = 3.0
+MIN_CURVE_SUPPORT_COLUMNS = 8
+MIN_HIGH_SUPPORT_COLUMNS = 4
+MIN_DISTINCT_STROKE_SEPARATION = 2.0
+
+DEFAULT_INK_WEIGHT = 0.35
+INK_DISTANCE_TOLERANCE = 3.0
+INK_MASKED_WEIGHT = 0.25
+SUPPORT_WINDOW_MAJOR = 0.5
+SUPPORT_MAX_GAP_MAJOR = 1.0
+SUPPORT_MIN_FRACTION = 0.55
+SUPPORT_MIN_EVALUABLE_FRACTION = 0.25
+
+JOIN_X = 1.0
+JOIN_PIXEL_TOLERANCE = 3.0
+DEFAULT_JOIN_MISMATCH = 0.05
+LOW_JOIN_PRIOR_WEIGHT = 0.25
+HIGH_JOIN_IMAGE_WEIGHT = 1.0
+JOIN_STRIP_MAJOR_FRACTION = 0.25
+JOIN_STRIP_MIN_WIDTH = 12
+JOIN_STRIP_MAX_WIDTH = 50
+JOIN_STRIP_PASSES = 3
+JOIN_STRIP_MIN_POINTS = 4
+
+PLAIN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Word:
     text: str
     confidence: float
@@ -97,1357 +107,5833 @@ class Word:
     def cy(self):
         return self.top + self.height / 2
 
+    @property
+    def right(self):
+        return self.left + self.width
+
+    @property
+    def bottom(self):
+        return self.top + self.height
+
+
+@dataclass(frozen=True)
+class ReferenceGrid:
+    intervals_x: int
+    intervals_y: float
+    major_x: float
+    major_y: float
+    pooled_major: float
+    median_label_error_x: float
+    median_label_error_y: float
+    aspect_error: float
+
+    @property
+    def minor_x(self):
+        return self.major_x / MINOR_DIVISIONS
+
+    @property
+    def minor_y(self):
+        return self.major_y / MINOR_DIVISIONS
+
+    @property
+    def minor_intervals_x(self):
+        return self.intervals_x * MINOR_DIVISIONS
+
+    @property
+    def minor_intervals_y(self):
+        return int(round(self.intervals_y * MINOR_DIVISIONS))
+
 
 @dataclass
-class Track:
-    horizontal: bool
-    points: np.ndarray
-    support: float
+class GridFit:
+    mask: np.ndarray
+    horizontal: list
+    vertical: list
+    measurements: list
+    accepted: int
+    attempted: int
+    reference: ReferenceGrid
 
 
-# ----------------------------------------------------------------------
-# Image preparation
-# ----------------------------------------------------------------------
-
-def read_image(path):
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        raise ValueError(f"Could not read image: {path}")
-    return image
+@dataclass(frozen=True)
+class JoinAnchor:
+    tag: str
+    value: float
+    sigma: float
+    low_supported: bool
 
 
-def binarize(gray):
+@dataclass
+class JoinGuidance:
+    pixel_x: float
+    u: float
+    initial_pixels: np.ndarray
+    initial_slopes: np.ndarray
+    prior_indices: np.ndarray
+    prior_targets: np.ndarray
+    prior_sigmas: np.ndarray
+    local_indices: np.ndarray
+    local_targets: np.ndarray
+    local_sigmas: np.ndarray
+    local_xs: np.ndarray
+    local_observations: np.ndarray
+
+
+@dataclass
+class InkEvidence:
+    distance: np.ndarray
+    grid_mask: np.ndarray
+    bounds: tuple
+
+
+@dataclass
+class ImageSupport:
+    dense_xs: np.ndarray
+    near_ink: np.ndarray
+    obscured: np.ndarray
+    inside: np.ndarray
+    right_edges: np.ndarray
+    sampled_mask: np.ndarray
+    window_states: np.ndarray
+    retained_fraction: np.ndarray
+    valid: np.ndarray
+
+
+@dataclass
+class CurveModel:
+    basis: object
+    coefficients: np.ndarray
+    tags: list
+    paths: list
+    seed_x: int
+    seed_ys: np.ndarray
+    basis_count: int
+    validation_cost: float
+    sample_xs: np.ndarray
+    assigned: np.ndarray
+    support: object
+    guidance: object
+
+
+@dataclass
+class PageResult:
+    image: Path
+    segment: str
+    bounds: tuple
+    x_fit: np.ndarray
+    y_fit: np.ndarray
+    model: CurveModel
+
+
+def save(path, image):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"Could not write {path}")
+
+
+def normalize(text):
+    return re.sub(
+        r"\s+",
+        "",
+        text.strip()
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace(",", "."),
+    )
+
+
+def number(text):
+    text = normalize(text)
+    if not re.fullmatch(PLAIN, text):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def clip(box, shape):
+    x0, y0, x1, y1 = box
+    return (
+        max(0, min(shape[1], math.floor(x0))),
+        max(0, min(shape[0], math.floor(y0))),
+        max(0, min(shape[1], math.ceil(x1))),
+        max(0, min(shape[0], math.ceil(y1))),
+    )
+
+
+def crop(image, box):
+    x0, y0, x1, y1 = clip(box, image.shape)
+    return image[y0:y1, x0:x1]
+
+
+def intersection(a, b):
+    return (
+        max(0, min(a[2], b[2]) - max(a[0], b[0]))
+        * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    )
+
+
+def box_of(word):
+    return word.left, word.top, word.right, word.bottom
+
+
+def binary_image(gray):
     block = max(15, min(81, (min(gray.shape) // 30) | 1))
-    binary = cv2.adaptiveThreshold(
+    return cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         block,
         12,
+    ) > 0
+
+
+def threshold_ink(gray):
+    return cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )[1]
+
+
+def draw_frame(image, bounds):
+    left, top, right, bottom = bounds
+    cv2.rectangle(
+        image,
+        (left, top),
+        (right, bottom),
+        (255, 255, 0),
+        2,
     )
-    return binary > 0
 
 
-def true_runs(values):
-    """Return [start, end) intervals of consecutive True values."""
-    padded = np.r_[False, values, False].astype(np.int8)
-    changes = np.diff(padded)
-    return list(zip(
-        np.flatnonzero(changes == 1),
-        np.flatnonzero(changes == -1),
-    ))
-
-
-def fill_short_gaps(values, maximum):
-    result = values.copy()
-    for start, end in true_runs(~values):
-        if (
-            start > 0
-            and end < len(values)
-            and end - start <= maximum
-        ):
-            result[start:end] = True
+def tint(image, mask, color):
+    result = image.copy()
+    result[mask] = (
+        0.35 * result[mask].astype(float)
+        + 0.65 * np.asarray(color, float)
+    ).astype(np.uint8)
     return result
 
 
-# ----------------------------------------------------------------------
-# Generated-grid fitting
-# ----------------------------------------------------------------------
-
-def rotation_matrix(shape, angle):
-    height, width = shape
-    return cv2.getRotationMatrix2D(
-        ((width - 1) / 2, (height - 1) / 2),
-        float(angle),
-        1.0,
-    )
-
-
-def rotate_foreground(ink, angle):
+def detect_lines(ink, horizontal, audit=None):
     height, width = ink.shape
-    matrix = rotation_matrix(ink.shape, angle)
-    rotated = cv2.warpAffine(
-        ink.astype(np.float32),
-        matrix,
-        (width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    return rotated, matrix
-
-
-def directional_support(evidence):
-    height, width = evidence.shape
-
-    vertical = cv2.boxFilter(
-        evidence,
-        -1,
-        (1, max(15, min(101, height // 12))),
-        normalize=True,
-        borderType=cv2.BORDER_CONSTANT,
-    )
-    horizontal = cv2.boxFilter(
-        evidence,
-        -1,
-        (max(15, min(101, width // 12)), 1),
-        normalize=True,
-        borderType=cv2.BORDER_CONSTANT,
-    )
-    return vertical, horizontal
-
-
-def prepare_profile(profile):
-    profile = gaussian_filter1d(
-        profile.astype(float), sigma=0.7
-    )
-    background = gaussian_filter1d(
-        profile, sigma=max(8, len(profile) / 45)
-    )
-    result = np.maximum(profile - background, 0)
-    maximum = float(result.max())
-
-    if maximum <= 1e-12:
-        raise ValueError("Insufficient directional grid evidence.")
-
-    return result / maximum
-
-
-def directional_profiles(evidence):
-    vertical, horizontal = directional_support(evidence)
-    x_profile = prepare_profile(np.mean(vertical ** 2, axis=0))
-    y_profile = prepare_profile(np.mean(horizontal ** 2, axis=1))
-    return x_profile, y_profile
-
-
-def estimate_angle_from_right(ink):
-    """Estimate a small global rotation using right-side vertical evidence."""
-    reference = ink[:, ink.shape[1] // 2:]
-    height, width = reference.shape
-    scale = min(1.0, 1200 / max(height, width))
-
-    reference = cv2.resize(
-        reference.astype(np.float32),
-        (
-            max(1, int(round(width * scale))),
-            max(1, int(round(height * scale))),
+    length = max(25, (width if horizontal else height) // 30)
+    opened = cv2.morphologyEx(
+        ink.astype(np.uint8) * 255,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (length, 1) if horizontal else (1, length),
         ),
-        interpolation=cv2.INTER_AREA,
     )
-
-    def score(angle):
-        aligned, _ = rotate_foreground(reference, angle)
-        vertical = cv2.boxFilter(
-            aligned,
-            -1,
-            (1, max(15, aligned.shape[0] // 10)),
-            normalize=True,
-            borderType=cv2.BORDER_CONSTANT,
-        )
-        profile = np.mean(vertical ** 2, axis=0)
-        count = min(len(profile), max(3, len(profile) // 50))
-        strongest = np.partition(
-            profile, len(profile) - count
-        )[-count:]
-        return float(np.mean(strongest))
-
-    coarse = np.linspace(-2.0, 2.0, 17)
-    best = float(max(coarse, key=score))
-    fine = np.linspace(best - 0.25, best + 0.25, 21)
-    return float(max(fine, key=score))
-
-
-def best_template_phase(profile, spacing):
-    """Fit the phase of a generated regular comb at fixed spacing."""
-    length = len(profile)
-    phase_count = max(24, int(math.ceil(2 * spacing)))
-    phases = np.linspace(0, spacing, phase_count, endpoint=False)
-
-    line_count = int(math.ceil(length / spacing)) + 1
-    locations = (
-        phases[:, None]
-        + spacing * np.arange(line_count)[None, :]
+    count, _, stats, centers = cv2.connectedComponentsWithStats(opened)
+    thickness = max(
+        8, int(0.006 * (height if horizontal else width))
     )
-    valid = locations <= length - 1
+    lines, raw = [], []
 
-    values = np.interp(
-        locations.ravel(),
-        np.arange(length),
-        profile,
-        left=0,
-        right=0,
-    ).reshape(locations.shape)
-
-    counts = valid.sum(axis=1)
-    scores = np.full(phase_count, -np.inf)
-    usable = counts >= 3
-
-    if not usable.any():
-        return None
-
-    scores[usable] = (
-        (values * valid).sum(axis=1)[usable] / counts[usable]
-    )
-    index = int(np.argmax(scores))
-    return float(scores[index]), float(phases[index])
-
-
-def fit_grid_from_right(aligned_ink):
-    """
-    Fit spacing from right-side vertical evidence.
-
-    Tests subdivisions of detected gaps to avoid locking onto major
-    grid lines while missing the finer grid.
-
-    A candidate must:
-    1. Explain observed vertical-line peaks.
-    2. Avoid predicting many unsupported intermediate lines.
-
-    Horizontal evidence determines only the horizontal-row phase.
-    """
-    height, width = aligned_ink.shape
-    right_start = width // 2
-    reference = aligned_ink[:, right_start:]
-
-    x_profile, y_profile = directional_profiles(reference)
-
-    # Retain faint lines as well as prominent major grid lines.
-    peaks, properties = find_peaks(
-        x_profile,
-        distance=3,
-        prominence=0.015,
-        height=0.02,
-    )
-
-    if len(peaks) < 5:
-        raise ValueError(
-            "Too few vertical-line peaks in the right-hand region."
+    for index in range(1, count):
+        x, y, w, h, area = map(int, stats[index])
+        along, across = (w, h) if horizontal else (h, w)
+        too_short = along < length
+        too_thick = (
+            across > thickness
+            or area / max(1, along) > thickness
         )
-
-    positions = peaks.astype(float)
-
-    # Give faint lines meaningful influence without weighting every
-    # tiny peak exactly like a strong grid line.
-    weights = np.sqrt(properties["prominences"])
-    weights = np.maximum(weights, 1e-6)
-
-    gaps = np.diff(positions)
-    minimum_spacing = 6.0
-    maximum_spacing = min(reference.shape) / 3
-
-    proposals = set()
-
-    # Include several neighboring-peak separations and their subdivisions.
-    # A separation can span multiple cells if faint peaks were missed.
-    for offset in (1, 2, 3):
-        if len(positions) <= offset:
-            continue
-
-        separations = positions[offset:] - positions[:-offset]
-
-        for separation in separations:
-            for divisor in range(1, 7):
-                pitch = float(separation) / divisor
-
-                if minimum_spacing <= pitch <= maximum_spacing:
-                    proposals.add(round(pitch, 2))
-
-    if not proposals:
-        raise ValueError("No plausible grid-spacing proposals.")
-
-    proposals = sorted(proposals)
-
-    # Keep the search bounded for noisy pages.
-    if len(proposals) > 600:
-        indices = np.linspace(
-            0, len(proposals) - 1, 600
-        ).astype(int)
-        proposals = [proposals[index] for index in indices]
-
-    first_peak = float(positions[0])
-    last_peak = float(positions[-1])
-
-    def evaluate(spacing):
-        # Candidate phases come from actual peak positions.
-        phases = np.unique(
-            np.round(np.mod(positions, spacing), 2)
-        )
-
-        if len(phases) > 100:
-            indices = np.linspace(
-                0, len(phases) - 1, 100
-            ).astype(int)
-            phases = phases[indices]
-
-        tolerance = min(2.0, 0.10 * spacing)
-        best_phase = None
-
-        for phase in phases:
-            grid_indices = np.rint(
-                (positions - phase) / spacing
-            ).astype(int)
-
-            residual = np.abs(
-                positions - (phase + grid_indices * spacing)
-            )
-            matched = residual <= tolerance
-
-            if matched.sum() < 4:
-                continue
-
-            unique_indices = np.unique(grid_indices[matched])
-            if len(unique_indices) < 4:
-                continue
-
-            # How much observed line evidence does this grid explain?
-            coverage = float(
-                weights[matched].sum() / weights.sum()
-            )
-
-            # Evaluate generated lines across the observed peak span.
-            lower_index = int(math.ceil(
-                (first_peak - phase) / spacing
-            ))
-            upper_index = int(math.floor(
-                (last_peak - phase) / spacing
-            ))
-
-            generated = (
-                phase
-                + np.arange(lower_index, upper_index + 1) * spacing
-            )
-
-            if len(generated) < 4:
-                continue
-
-            nearest = np.min(
-                np.abs(generated[:, None] - positions[None, :]),
-                axis=1,
-            )
-
-            # Unsupported intermediate lines penalize an overly fine grid.
-            occupancy = float(np.mean(nearest <= tolerance))
-
-            # A coarse grid is penalized for unexplained observed lines.
-            # A fine grid is penalized for unsupported generated lines.
-            score = (
-                2 * coverage * occupancy
-                / max(coverage + occupancy, 1e-12)
-            )
-
-            error = float(np.average(
-                residual[matched],
-                weights=weights[matched],
-            ))
-
-            candidate = {
-                "score": score,
-                "error": error,
-                "spacing": float(spacing),
-                "phase": float(phase),
-                "coverage": coverage,
-                "occupancy": occupancy,
-            }
-
-            if best_phase is None or (
-                candidate["score"], -candidate["error"]
-            ) > (
-                best_phase["score"], -best_phase["error"]
-            ):
-                best_phase = candidate
-
-        return best_phase
-
-    best = None
-
-    for spacing in proposals:
-        candidate = evaluate(spacing)
-
-        if candidate is not None:
-            if best is None or (
-                candidate["score"], -candidate["error"]
-            ) > (
-                best["score"], -best["error"]
-            ):
-                best = candidate
-
-    if best is None:
-        raise ValueError(
-            "No consistent grid spacing found in right-side evidence."
-        )
-
-    # Refine without allowing a jump to another spacing multiple.
-    spacing = best["spacing"]
-    phase = best["phase"]
-    initial_spacing = spacing
-
-    for _ in range(5):
-        indices = np.rint(
-            (positions - phase) / spacing
-        ).astype(int)
-
-        residual = positions - (phase + indices * spacing)
-        tolerance = min(2.0, 0.10 * spacing)
-        matched = np.abs(residual) <= tolerance
-
-        if len(np.unique(indices[matched])) < 4:
-            raise ValueError(
-                "Too few consistent grid lines after refinement."
-            )
-
-        new_spacing, new_phase = np.polyfit(
-            indices[matched],
-            positions[matched],
-            1,
-            w=np.sqrt(weights[matched]),
-        )
-
-        if not (
-            0.95 * initial_spacing
-            <= new_spacing
-            <= 1.05 * initial_spacing
-        ):
-            break
-
-        spacing = float(new_spacing)
-        phase = float(new_phase)
-
-    indices = np.rint(
-        (positions - phase) / spacing
-    ).astype(int)
-    residual = positions - (phase + indices * spacing)
-    matched = np.abs(residual) <= min(2.0, 0.10 * spacing)
-
-    # Merge any detections assigned to the same grid index.
-    grouped = {}
-    for index, position in zip(indices[matched], positions[matched]):
-        grouped.setdefault(int(index), []).append(float(position))
-
-    ordered = sorted(
-        (index, float(np.median(values)))
-        for index, values in grouped.items()
-    )
-
-    if len(ordered) < 4:
-        raise ValueError("Fewer than four distinct fitted grid lines.")
-
-    measured_spacings = [
-        (p1 - p0) / (i1 - i0)
-        for (i0, p0), (i1, p1) in zip(ordered, ordered[1:])
-        if i1 > i0
-    ]
-
-    fit_positions = np.array([p for _, p in ordered])
-    fit_indices = np.array([i for i, _ in ordered])
-    fit_residual = fit_positions - (phase + fit_indices * spacing)
-
-    y_fit = best_template_phase(y_profile, spacing)
-    if y_fit is None:
-        raise ValueError(
-            "Could not place horizontal rows at the fitted spacing."
-        )
-
-    return {
-        "spacing": float(spacing),
-        "x_phase": float((phase + right_start) % spacing),
-        "y_phase": float(y_fit[1]),
-        "spacing_source": "right-side vertical lattice with subdivision tests",
-        "reference_bounds_aligned": [
-            right_start, 0, width - 1, height - 1
-        ],
-        "detected_vertical_peaks": int(len(peaks)),
-        "trusted_vertical_lines": int(len(ordered)),
-        "measured_interval_count": int(len(measured_spacings)),
-        "mean_adjacent_spacing": float(np.mean(measured_spacings)),
-        "adjacent_spacing_std": float(
-            np.std(measured_spacings, ddof=1)
-        ),
-        "vertical_fit_residual_std": float(
-            np.std(fit_residual, ddof=1)
-        ),
-        "reference_vertical_positions_aligned": (
-            fit_positions + right_start
-        ).tolist(),
-        "horizontal_phase_score": float(y_fit[0]),
-        "vertical_peak_coverage": float(best["coverage"]),
-        "generated_line_occupancy": float(best["occupancy"]),
-    }
-
-
-def grid_positions(length, phase, spacing):
-    return np.arange(phase, length - 1, spacing)
-
-
-def supported_runs(support, position, horizontal, spacing):
-    """
-    Determine visible extents along a generated line.
-
-    Evidence can activate a line but cannot move it or add another line.
-    """
-    coordinate = int(round(position))
-
-    if horizontal:
-        if not 0 <= coordinate < support.shape[0]:
-            return []
-        lo = max(0, coordinate - 1)
-        hi = min(support.shape[0], coordinate + 2)
-        evidence = np.max(support[lo:hi, :], axis=0)
-    else:
-        if not 0 <= coordinate < support.shape[1]:
-            return []
-        lo = max(0, coordinate - 1)
-        hi = min(support.shape[1], coordinate + 2)
-        evidence = np.max(support[:, lo:hi], axis=1)
-
-    present = fill_short_gaps(
-        evidence >= 0.60,
-        maximum=max(3, int(0.15 * spacing)),
-    )
-    minimum_length = max(30, int(2 * spacing))
-
-    return [
-        (int(start), int(end))
-        for start, end in true_runs(present)
-        if end - start >= minimum_length
-    ]
-
-
-def render_expected_grid(shape, model):
-    height, width = shape
-    aligned = np.zeros(shape, dtype=np.uint8)
-
-    for x in grid_positions(width, model["x_phase"], model["spacing"]):
-        cv2.line(
-            aligned,
-            (int(round(x)), 0),
-            (int(round(x)), height - 1),
-            255,
-            model["line_width"],
-        )
-
-    for y in grid_positions(height, model["y_phase"], model["spacing"]):
-        cv2.line(
-            aligned,
-            (0, int(round(y))),
-            (width - 1, int(round(y))),
-            255,
-            model["line_width"],
-        )
-
-    return cv2.warpAffine(
-        aligned,
-        np.array(model["inverse_matrix"], dtype=float),
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-
-def make_grid_mask(ink):
-    angle = estimate_angle_from_right(ink)
-    aligned, matrix = rotate_foreground(ink, angle)
-
-    # Fit parameters using the right half, then apply them everywhere.
-    model = fit_grid_from_right(aligned)
-    model["alignment_angle_degrees"] = angle
-    model["line_width"] = 5
-
-    inverse = cv2.invertAffineTransform(matrix)
-    model["inverse_matrix"] = inverse.tolist()
-
-    vertical_support, horizontal_support = directional_support(aligned)
-    height, width = ink.shape
-    aligned_mask = np.zeros(ink.shape, dtype=np.uint8)
-    tracks = []
-
-    def add_track(horizontal, position, start, end):
-        along = np.arange(start, end, dtype=float)
-        across = np.full(end - start, position, dtype=float)
-
-        points = (
-            np.column_stack((along, across))
-            if horizontal else np.column_stack((across, along))
-        )
-
-        cv2.polylines(
-            aligned_mask,
-            [np.rint(points).astype(np.int32)],
-            False,
-            255,
-            thickness=model["line_width"],
-        )
-
-        original = cv2.transform(
-            points.reshape(-1, 1, 2), inverse
-        ).reshape(-1, 2)
-
-        tracks.append(Track(horizontal, original, 1.0))
-
-    for x in grid_positions(width, model["x_phase"], model["spacing"]):
-        for start, end in supported_runs(
-            vertical_support, x, False, model["spacing"]
-        ):
-            add_track(False, x, start, end)
-
-    for y in grid_positions(height, model["y_phase"], model["spacing"]):
-        for start, end in supported_runs(
-            horizontal_support, y, True, model["spacing"]
-        ):
-            add_track(True, y, start, end)
-
-    mask = cv2.warpAffine(
-        aligned_mask,
-        inverse,
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ) > 0
-
-    model["horizontal_segments"] = sum(t.horizontal for t in tracks)
-    model["vertical_segments"] = sum(not t.horizontal for t in tracks)
-    return mask, tracks, model
-
-
-# ----------------------------------------------------------------------
-# Automatic plot-section detection
-# ----------------------------------------------------------------------
-
-def detect_panels(mask, tracks):
-    height, width = mask.shape
-    joined = cv2.dilate(
-        mask.astype(np.uint8), np.ones((5, 5), np.uint8)
-    )
-    count, _, stats, _ = cv2.connectedComponentsWithStats(joined)
-    panels = []
-
-    for i in range(1, count):
-        x, y, cw, ch, area = map(int, stats[i])
-        if (
-            cw >= 0.14 * width
-            and ch >= 0.15 * height
-            and area >= 0.001 * height * width
-        ):
-            ys, xs = np.nonzero(mask[y:y + ch, x:x + cw])
-            if len(xs):
-                panels.append(Panel(
-                    x + int(xs.min()),
-                    y + int(ys.min()),
-                    x + int(xs.max()),
-                    y + int(ys.max()),
-                ))
-
-    panels.sort(key=lambda p: p.left)
-    if not panels:
-        raise ValueError("No plausible plot region found in the grid mask.")
-    if len(panels) != 1:
-        return panels
-
-    panel = panels[0]
-    vertical = []
-
-    for track in tracks:
-        if track.horizontal:
-            continue
-        top = float(np.min(track.points[:, 1]))
-        bottom = float(np.max(track.points[:, 1]))
-        if bottom - top >= 0.25 * (panel.bottom - panel.top):
-            vertical.append((
-                float(np.median(track.points[:, 0])),
-                top,
-                bottom,
-            ))
+        accepted = not (too_short or too_thick)
+
+        if audit is not None:
+            raw.append({
+                "box": (x, y, x + w - 1, y + h - 1),
+                "accepted": accepted,
+                "reason": (
+                    ("L" if too_short else "")
+                    + ("T" if too_thick else "")
+                ),
+            })
+
+        if accepted:
+            if horizontal:
+                lines.append(
+                    (float(centers[index][1]), x, x + w - 1)
+                )
+            else:
+                lines.append(
+                    (float(centers[index][0]), y, y + h - 1)
+                )
 
     groups = []
-    for record in sorted(vertical):
+    for line in sorted(lines):
         if (
             groups
-            and abs(record[0] - np.mean(
-                [item[0] for item in groups[-1]]
-            )) < 5
+            and abs(
+                line[0] - np.median([v[0] for v in groups[-1]])
+            ) <= 4
         ):
-            groups[-1].append(record)
+            groups[-1].append(line)
         else:
-            groups.append([record])
+            groups.append([line])
 
-    vertical = [
+    grouped = [
         (
-            float(np.mean([r[0] for r in group])),
-            float(min(r[1] for r in group)),
-            float(max(r[2] for r in group)),
+            float(np.median([v[0] for v in group])),
+            float(min(v[1] for v in group)),
+            float(max(v[2] for v in group)),
         )
         for group in groups
     ]
 
-    best = None
-    for split in range(3, len(vertical) - 2):
-        before = np.array(vertical[:split])
-        after = np.array(vertical[split:])
-        extent_a = np.median(before[:, 1:], axis=0)
-        extent_b = np.median(after[:, 1:], axis=0)
+    if audit is not None:
+        key = "horizontal" if horizontal else "vertical"
+        audit[f"{key}_raw"] = raw
+        audit[f"{key}_accepted"] = grouped.copy()
+        audit[f"{key}_length_limit"] = length
+        audit[f"{key}_thickness_limit"] = thickness
 
-        difference = float(np.max(np.abs(extent_a - extent_b)))
-        scatter = float(
-            np.median(np.abs(before[:, 1:] - extent_a))
-            + np.median(np.abs(after[:, 1:] - extent_b))
+    return grouped
+
+
+def intersections(horizontal, vertical):
+    result = np.zeros((len(horizontal), len(vertical)), bool)
+    for i, (y, x0, x1) in enumerate(horizontal):
+        for j, (x, y0, y1) in enumerate(vertical):
+            result[i, j] = (
+                x0 - 6 <= x <= x1 + 6
+                and y0 - 6 <= y <= y1 + 6
+            )
+    return result
+
+
+def components(matrix):
+    seen_h, seen_v = set(), set()
+    result = []
+
+    for initial in range(matrix.shape[0]):
+        if initial in seen_h:
+            continue
+
+        pending = [(True, initial)]
+        hs, vs = set(), set()
+
+        while pending:
+            horizontal, index = pending.pop()
+            if horizontal:
+                if index in seen_h:
+                    continue
+                seen_h.add(index)
+                hs.add(index)
+                pending.extend(
+                    (False, int(j))
+                    for j in np.flatnonzero(matrix[index])
+                    if int(j) not in seen_v
+                )
+            else:
+                if index in seen_v:
+                    continue
+                seen_v.add(index)
+                vs.add(index)
+                pending.extend(
+                    (True, int(i))
+                    for i in np.flatnonzero(matrix[:, index])
+                    if int(i) not in seen_h
+                )
+
+        if hs and vs:
+            result.append((sorted(hs), sorted(vs)))
+
+    return result
+
+
+def outer_endpoint(values, lower, tolerance):
+    groups = []
+    for value in sorted(values):
+        if groups and value - np.mean(groups[-1]) <= tolerance:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+
+    minimum = max(2, math.ceil(0.08 * len(values)))
+    supported = [g for g in groups if len(g) >= minimum]
+
+    if supported:
+        return float(np.median(
+            supported[0] if lower else supported[-1]
+        ))
+    return float(np.percentile(values, 10 if lower else 90))
+
+
+def detect_frame(ink, audit=None):
+    if audit is not None:
+        audit.clear()
+        for family in ("horizontal", "vertical"):
+            for stage in ("raw", "accepted", "pruned", "selected"):
+                audit[f"{family}_{stage}"] = []
+        audit["bounds"] = None
+        audit["component_count"] = 0
+
+    horizontal = detect_lines(ink, True, audit)
+    vertical = detect_lines(ink, False, audit)
+    if not horizontal or not vertical:
+        return None
+
+    matrix = intersections(horizontal, vertical)
+    keep_h = np.ones(len(horizontal), bool)
+    keep_v = np.ones(len(vertical), bool)
+
+    for _ in range(10):
+        new_h = keep_h & (
+            matrix[:, keep_v].sum(axis=1) >= MIN_CROSSINGS
         )
-        score = difference - 3 * scatter
-        threshold = max(15, 0.07 * (panel.bottom - panel.top))
+        new_v = keep_v & (
+            matrix[keep_h, :].sum(axis=0) >= MIN_CROSSINGS
+        )
+        if (
+            np.array_equal(new_h, keep_h)
+            and np.array_equal(new_v, keep_v)
+        ):
+            break
+        keep_h, keep_v = new_h, new_v
 
-        if difference >= threshold and score >= threshold / 2:
-            if best is None or score > best[0]:
-                best = (score, split, extent_a, extent_b)
-
-    if best is None:
-        return panels
-
-    _, split, extent_a, extent_b = best
-    seam = int(round(
-        (vertical[split - 1][0] + vertical[split][0]) / 2
-    ))
-
-    return [
-        Panel(
-            panel.left,
-            max(0, int(round(extent_a[0]))),
-            seam,
-            min(height - 1, int(round(extent_a[1]))),
-        ),
-        Panel(
-            seam,
-            max(0, int(round(extent_b[0]))),
-            panel.right,
-            min(height - 1, int(round(extent_b[1]))),
-        ),
+    horizontal = [
+        v for v, keep in zip(horizontal, keep_h) if keep
+    ]
+    vertical = [
+        v for v, keep in zip(vertical, keep_v) if keep
     ]
 
+    if audit is not None:
+        audit["horizontal_pruned"] = horizontal.copy()
+        audit["vertical_pruned"] = vertical.copy()
 
-# ----------------------------------------------------------------------
-# OCR and axis calibration
-# ----------------------------------------------------------------------
+    if not horizontal or not vertical:
+        return None
 
-def configure_tesseract():
+    matrix = intersections(horizontal, vertical)
+    choices = []
+
+    for hi, vi in components(matrix):
+        if min(len(hi), len(vi)) < MIN_CROSSINGS:
+            continue
+
+        crossings = int(matrix[np.ix_(hi, vi)].sum())
+        choices.append((
+            crossings * crossings / (len(hi) * len(vi)),
+            hi,
+            vi,
+        ))
+
+    if audit is not None:
+        audit["component_count"] = len(choices)
+    if not choices:
+        return None
+
+    _, hi, vi = max(choices, key=lambda value: value[0])
+    horizontal = [horizontal[i] for i in hi]
+    vertical = [vertical[i] for i in vi]
+
+    if audit is not None:
+        audit["horizontal_selected"] = horizontal.copy()
+        audit["vertical_selected"] = vertical.copy()
+
+    height, width = ink.shape
+    bounds = (
+        max(0, round(outer_endpoint(
+            [v[1] for v in horizontal],
+            True,
+            max(6, 0.004 * width),
+        ))),
+        max(0, round(outer_endpoint(
+            [v[1] for v in vertical],
+            True,
+            max(6, 0.004 * height),
+        ))),
+        min(width - 1, round(outer_endpoint(
+            [v[2] for v in horizontal],
+            False,
+            max(6, 0.004 * width),
+        ))),
+        min(height - 1, round(outer_endpoint(
+            [v[2] for v in vertical],
+            False,
+            max(6, 0.004 * height),
+        ))),
+    )
+
+    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        return None
+
+    if audit is not None:
+        audit["bounds"] = bounds
+
+    return bounds
+
+
+def frame_detection_preview(gray, audit):
+    source = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    height, width = gray.shape
+    scale = min(1.0, 1100.0 / max(height, width))
+    pw = max(1, round(width * scale))
+    ph = max(1, round(height * scale))
+    header = 76
+
+    def point(x, y):
+        return round(x * scale), round(y * scale) + header
+
+    def panel(title, subtitle):
+        canvas = np.full((ph + header, pw, 3), 255, np.uint8)
+        canvas[header:] = cv2.resize(
+            source,
+            (pw, ph),
+            interpolation=cv2.INTER_AREA,
+        )
+        cv2.putText(
+            canvas,
+            title,
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            subtitle,
+            (10, 49),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.39,
+            (40, 40, 40),
+            1,
+            cv2.LINE_AA,
+        )
+        return canvas
+
+    def draw_segments(image, stage):
+        for y, x0, x1 in audit.get(f"horizontal_{stage}", []):
+            cv2.line(
+                image,
+                point(x0, y),
+                point(x1, y),
+                (255, 80, 0),
+                2,
+            )
+        for x, y0, y1 in audit.get(f"vertical_{stage}", []):
+            cv2.line(
+                image,
+                point(x, y0),
+                point(x, y1),
+                (0, 140, 255),
+                2,
+            )
+
+    first = panel(
+        "1. Components after directional opening",
+        "Green=accepted; magenta=rejected; T=thickness; L=length.",
+    )
+    raw = sorted(
+        audit.get("horizontal_raw", [])
+        + audit.get("vertical_raw", []),
+        key=lambda item: not item["accepted"],
+    )
+
+    for item in raw:
+        x0, y0, x1, y1 = item["box"]
+        color = (
+            (0, 170, 0) if item["accepted"] else (180, 0, 180)
+        )
+        cv2.rectangle(
+            first,
+            point(x0, y0),
+            point(x1, y1),
+            color,
+            1,
+        )
+        if not item["accepted"]:
+            px, py = point(x0, y0)
+            cv2.putText(
+                first,
+                item["reason"],
+                (px + 2, max(header + 12, py - 2)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    second = panel(
+        "2. Accepted and grouped segments",
+        f"H={len(audit.get('horizontal_accepted', []))}; "
+        f"V={len(audit.get('vertical_accepted', []))}.",
+    )
+    draw_segments(second, "accepted")
+
+    third = panel(
+        "3. After intersection pruning",
+        f"H={len(audit.get('horizontal_pruned', []))}; "
+        f"V={len(audit.get('vertical_pruned', []))}.",
+    )
+    draw_segments(third, "pruned")
+
+    bounds = audit.get("bounds")
+    fourth = panel(
+        "4. Selected component and inferred frame",
+        f"bounds={bounds}; "
+        f"components={audit.get('component_count', 0)}.",
+    )
+    draw_segments(fourth, "selected")
+
+    if bounds is not None:
+        left, top, right, bottom = bounds
+        cv2.rectangle(
+            fourth,
+            point(left, top),
+            point(right, bottom),
+            (255, 255, 0),
+            3,
+        )
+
+    return np.vstack((
+        np.hstack((first, second)),
+        np.hstack((third, fourth)),
+    ))
+
+
+def find_tesseract():
     candidates = [
         os.environ.get("TESSERACT_CMD"),
         shutil.which("tesseract"),
+        pytesseract.pytesseract.tesseract_cmd,
     ]
 
     if os.name == "nt":
         for variable in (
-            "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "LOCALAPPDATA",
         ):
             root = os.environ.get(variable)
             if root:
                 candidates.extend([
                     Path(root) / "Tesseract-OCR" / "tesseract.exe",
-                    Path(root) / "Programs" / "Tesseract-OCR"
-                    / "tesseract.exe",
+                    Path(root) / "Programs"
+                    / "Tesseract-OCR" / "tesseract.exe",
                 ])
-
-    candidates.append(pytesseract.pytesseract.tesseract_cmd)
 
     for candidate in candidates:
         if not candidate:
             continue
+
         executable = shutil.which(str(candidate))
         if executable is None and Path(candidate).is_file():
             executable = str(Path(candidate).resolve())
 
         if executable:
             pytesseract.pytesseract.tesseract_cmd = executable
-            return {
-                "executable": executable,
-                "version": str(pytesseract.get_tesseract_version()),
-            }
+            return True
 
-    raise RuntimeError(
-        "Could not locate Tesseract. Install the engine or set "
-        "TESSERACT_CMD to the full path of tesseract.exe."
-    )
+    return False
 
 
-def read_words(gray):
-    words = []
-    for psm in (11, 6):
+def read_words(gray, modes=(11, 6), minimum=OCR_MIN_CONFIDENCE):
+    result = []
+
+    for psm in modes:
         data = pytesseract.image_to_data(
             gray,
             config=f"--psm {psm}",
             output_type=pytesseract.Output.DICT,
         )
-
         for i, text in enumerate(data["text"]):
             text = text.strip()
             confidence = float(data["conf"][i])
-            if not text or confidence < 15:
-                continue
+            if text and confidence >= minimum:
+                result.append(Word(
+                    text,
+                    confidence,
+                    int(data["left"][i]),
+                    int(data["top"][i]),
+                    int(data["width"][i]),
+                    int(data["height"][i]),
+                ))
 
-            word = Word(
-                text, confidence,
-                int(data["left"][i]), int(data["top"][i]),
-                int(data["width"][i]), int(data["height"][i]),
-            )
-
-            if not any(
-                word.text == old.text
-                and abs(word.cx - old.cx) < 5
-                and abs(word.cy - old.cy) < 5
-                for old in words
-            ):
-                words.append(word)
-    return words
+    return result
 
 
-def parse_number(text):
-    text = (
-        text.replace("−", "-")
-        .replace("–", "-")
-        .replace(",", ".")
-        .strip()
+def unique_words(words):
+    result = []
+
+    for word in sorted(words, key=lambda w: -w.confidence):
+        if any(
+            normalize(word.text) == normalize(old.text)
+            and intersection(box_of(word), box_of(old))
+            / max(1, min(
+                word.width * word.height,
+                old.width * old.height,
+            )) >= 0.6
+            for old in result
+        ):
+            continue
+        result.append(word)
+
+    return result
+
+
+def ocr_region_words(gray, box):
+    x0, y0, x1, y1 = clip(box, gray.shape)
+    image = gray[y0:y1, x0:x1]
+    if image.size == 0:
+        return []
+
+    scale, border = 3, 20
+    prepared = cv2.copyMakeBorder(
+        cv2.resize(
+            image,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        ),
+        border,
+        border,
+        border,
+        border,
+        cv2.BORDER_CONSTANT,
+        value=255,
     )
-    if not re.fullmatch(
-        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
-        text,
-    ):
-        return None
-    value = float(text)
-    return value if math.isfinite(value) else None
+    result = []
+
+    for word in read_words(prepared, minimum=0):
+        left = max(
+            x0,
+            math.floor(x0 + (word.left - border) / scale),
+        )
+        top = max(
+            y0,
+            math.floor(y0 + (word.top - border) / scale),
+        )
+        right = min(
+            x1,
+            math.ceil(x0 + (word.right - border) / scale),
+        )
+        bottom = min(
+            y1,
+            math.ceil(y0 + (word.bottom - border) / scale),
+        )
+        if right > left and bottom > top:
+            result.append(Word(
+                word.text,
+                word.confidence,
+                left,
+                top,
+                right - left,
+                bottom - top,
+            ))
+
+    return result
 
 
-def fit_axis(samples, increasing):
-    if len(samples) < 3:
-        raise ValueError("Fewer than three readable axis-label candidates.")
+def numeric_readings(gray, box):
+    image = crop(gray, box)
+    if image.size == 0:
+        return []
 
-    pixels = np.array([s[0] for s in samples], float)
-    values = np.array([s[1] for s in samples], float)
+    enlarged = cv2.resize(
+        image,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    binary = 255 - threshold_ink(enlarged)
+    result = []
+
+    for variant in (enlarged, binary):
+        prepared = cv2.copyMakeBorder(
+            variant,
+            24,
+            24,
+            24,
+            24,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+        for psm in (7, 13):
+            text = normalize(pytesseract.image_to_string(
+                prepared,
+                config=(
+                    f"--psm {psm} "
+                    "-c tessedit_char_whitelist=0123456789.+-"
+                ),
+            ))
+            if number(text) is not None:
+                result.append(text)
+
+    return result
+
+
+def consistent_sequence(words, horizontal):
+    words = [w for w in words if number(w.text) is not None]
+    if len(words) < MIN_AXIS_LABELS:
+        return []
+
+    positions = np.array([
+        w.cx if horizontal else w.cy for w in words
+    ])
+    values = np.array([number(w.text) for w in words], float)
+    tolerance = max(
+        3.0,
+        0.30 * np.median([w.height for w in words]),
+    )
     best = None
 
-    for i in range(len(samples)):
-        for j in range(i + 1, len(samples)):
-            if abs(pixels[j] - pixels[i]) < 15:
+    for i in range(len(words)):
+        for j in range(i + 1, len(words)):
+            if abs(positions[j] - positions[i]) < 10:
                 continue
 
-            a = (values[j] - values[i]) / (pixels[j] - pixels[i])
-            if a == 0 or (a > 0) != increasing:
+            slope = (
+                (values[j] - values[i])
+                / (positions[j] - positions[i])
+            )
+            if slope == 0 or (slope > 0) != horizontal:
                 continue
 
-            b = values[i] - a * pixels[i]
-            residual = np.abs((values - b) / a - pixels)
-            selected = residual < 9
+            intercept = values[i] - slope * positions[i]
+            residual = np.abs(
+                (values - intercept) / slope - positions
+            )
+            chosen = []
 
-            if selected.sum() < 3:
-                continue
+            for k in sorted(
+                np.flatnonzero(residual <= tolerance),
+                key=lambda k: (
+                    residual[k],
+                    -words[k].confidence,
+                ),
+            ):
+                if not any(
+                    abs(positions[k] - positions[old]) < 10
+                    for old in chosen
+                ):
+                    chosen.append(int(k))
+
             if (
-                len(np.unique(np.round(pixels[selected] / 5))) < 3
-                or len(np.unique(values[selected])) < 3
+                len(chosen) < MIN_AXIS_LABELS
+                or len(np.unique(values[chosen])) < MIN_AXIS_LABELS
             ):
                 continue
 
             score = (
-                int(selected.sum()),
-                float(np.ptp(pixels[selected])),
-                -float(residual[selected].mean()),
+                len(chosen),
+                float(np.ptp(positions[chosen])),
+                -float(residual[chosen].mean()),
+                float(np.mean([
+                    words[k].confidence for k in chosen
+                ])),
             )
             if best is None or score > best[0]:
-                best = (score, selected)
+                best = (score, chosen)
 
     if best is None:
-        raise ValueError("No consistent linear axis calibration.")
+        return []
 
-    selected = best[1]
-    a, b = np.polyfit(pixels[selected], values[selected], 1)
-    return {
-        "a": float(a),
-        "b": float(b),
-        "labels": [
-            [float(p), float(v)]
-            for p, v in zip(pixels[selected], values[selected])
-        ],
-    }
+    return sorted(
+        [words[k] for k in best[1]],
+        key=lambda w: w.cx if horizontal else w.cy,
+    )
 
 
-def calibrate(panel, words):
-    width = panel.right - panel.left
-    height = panel.bottom - panel.top
-    x_samples, y_samples = [], []
+def select_bottom(words, bounds):
+    left, top, right, bottom = bounds
+    margin = max(
+        45,
+        int(BOTTOM_LABEL_BAND_FRACTION * (bottom - top)),
+    )
+    candidates = [
+        w for w in words
+        if number(w.text) is not None
+        and left - 15 <= w.cx <= right + 15
+        and bottom <= w.cy <= bottom + margin
+    ]
+    if not candidates:
+        return []
 
-    for word in words:
-        value = parse_number(word.text)
-        if value is None:
+    tolerance = max(
+        8,
+        0.7 * np.median([w.height for w in candidates]),
+    )
+    choices = []
+
+    for anchor in candidates:
+        selected = consistent_sequence(
+            [
+                w for w in candidates
+                if abs(w.cy - anchor.cy) <= tolerance
+            ],
+            True,
+        )
+        if selected:
+            choices.append((
+                float(np.median([
+                    w.cy - bottom for w in selected
+                ])),
+                -len(selected),
+                selected,
+            ))
+
+    return (
+        min(choices, key=lambda value: (value[0], value[1]))[2]
+        if choices else []
+    )
+
+
+def pooled_major_spacing(bottom, right):
+    xp = np.array(sorted(w.cx for w in bottom), float)
+    yp = np.array(sorted(w.cy for w in right), float)
+    gaps = np.concatenate((np.diff(xp), np.diff(yp)))
+    gaps = gaps[np.isfinite(gaps) & (gaps > 0)]
+
+    if not len(gaps):
+        raise ValueError("Insufficient label-centre gaps.")
+
+    spacing = float(np.median(gaps))
+    if not math.isfinite(spacing) or spacing <= 0:
+        raise ValueError("Invalid pooled grid spacing.")
+
+    return spacing
+
+
+def reference_axis_candidates(
+    positions,
+    start,
+    end,
+    pooled,
+    allow_half=False,
+    anchor_at_end=False,
+):
+    span = float(end - start)
+
+    if allow_half:
+        central = max(1, int(round(2.0 * span / pooled)))
+        counts = [
+            value / 2.0
+            for value in sorted({
+                max(1, central + offset)
+                for offset in (-2, -1, 0, 1, 2)
+            })
+        ]
+    else:
+        central = max(1, int(round(span / pooled)))
+        counts = sorted({
+            max(1, central - 1),
+            central,
+            central + 1,
+        })
+
+    result = []
+
+    for count in counts:
+        spacing = span / count
+        largest = int(math.floor(count + 1e-9))
+
+        if anchor_at_end:
+            indices = np.clip(
+                np.rint((end - positions) / spacing),
+                0,
+                largest,
+            )
+            predicted = end - indices * spacing
+        else:
+            indices = np.clip(
+                np.rint((positions - start) / spacing),
+                0,
+                largest,
+            )
+            predicted = start + indices * spacing
+
+        residual = positions - predicted
+        normalized = residual / max(3.0, 0.12 * spacing)
+        alignment = float(np.mean(
+            2.0 * (np.sqrt(1.0 + normalized ** 2) - 1.0)
+        ))
+        prior = 0.25 * (
+            (spacing - pooled) / (0.10 * pooled)
+        ) ** 2
+
+        result.append((
+            count,
+            spacing,
+            alignment + prior,
+            float(np.median(np.abs(residual))),
+        ))
+
+    return result
+
+
+def fit_reference_grid(bottom, right, bounds):
+    left, top, end, bottom_y = bounds
+    pooled = pooled_major_spacing(bottom, right)
+    xp = np.array(sorted(w.cx for w in bottom), float)
+    yp = np.array(sorted(w.cy for w in right), float)
+
+    if not len(xp) or not len(yp):
+        raise ValueError("Need bottom and right labels.")
+
+    horizontal = reference_axis_candidates(
+        xp, left, end, pooled
+    )
+    vertical = reference_axis_candidates(
+        yp,
+        top,
+        bottom_y,
+        pooled,
+        allow_half=True,
+        anchor_at_end=True,
+    )
+    choices = []
+
+    for nx, gx, sx, ex in horizontal:
+        for ny, gy, sy, ey in vertical:
+            square = 0.25 * (
+                (gx - gy) / (0.05 * pooled)
+            ) ** 2
+            choices.append((
+                sx + sy + square,
+                nx,
+                ny,
+                gx,
+                gy,
+                ex,
+                ey,
+            ))
+
+    _, nx, ny, gx, gy, ex, ey = min(
+        choices,
+        key=lambda choice: choice[0],
+    )
+
+    return ReferenceGrid(
+        int(nx),
+        float(ny),
+        gx,
+        gy,
+        pooled,
+        ex,
+        ey,
+        abs(gx - gy) / ((gx + gy) / 2.0),
+    )
+
+
+def validate_reference_grid(reference):
+    if reference.aspect_error > REFERENCE_GRID_MAX_ASPECT_ERROR:
+        raise ValueError(
+            "Horizontal/vertical major spacings disagree by "
+            f"{reference.aspect_error:.1%}."
+        )
+
+    if (
+        reference.median_label_error_x
+        > REFERENCE_GRID_MAX_MEDIAN_LABEL_ERROR * reference.major_x
+        or reference.median_label_error_y
+        > REFERENCE_GRID_MAX_MEDIAN_LABEL_ERROR * reference.major_y
+    ):
+        raise ValueError(
+            "Boundary-fitted major positions disagree with labels."
+        )
+
+    if reference.aspect_error > REFERENCE_GRID_WARN_ASPECT_ERROR:
+        print(
+            "Warning: horizontal/vertical major spacings differ by "
+            f"{reference.aspect_error:.1%}.",
+            file=sys.stderr,
+        )
+
+
+def recover_bottom_labels(gray, labels, right_labels, bounds):
+    if (
+        len(labels) < MIN_AXIS_LABELS
+        or len(right_labels) < MIN_AXIS_LABELS
+    ):
+        return labels
+
+    labels = sorted(labels, key=lambda w: w.cx)
+    reference = fit_reference_grid(labels, right_labels, bounds)
+    spacing = reference.major_x
+
+    slope, intercept = np.polyfit(
+        np.array([w.cx for w in labels]),
+        np.array([number(w.text) for w in labels], float),
+        1,
+    )
+    if not math.isfinite(slope) or slope <= 0:
+        return labels
+
+    tolerance = max(
+        1e-9,
+        abs(slope * spacing) * LABEL_STEP_TOLERANCE,
+    )
+    left, _, right, bottom = bounds
+    y0 = max(bottom + 1, min(w.top for w in labels) - 4)
+    y1 = min(gray.shape[0], max(w.bottom for w in labels) + 4)
+    if y1 <= y0:
+        return labels
+
+    half_width = max(
+        8.0,
+        min(
+            0.42 * spacing,
+            max(w.width for w in labels) * 0.8 + 6,
+        ),
+    )
+    additions = []
+    unread = 0
+
+    for center in np.linspace(
+        left,
+        right,
+        reference.intervals_x + 1,
+    ):
+        if any(
+            abs(center - w.cx) < 0.35 * spacing
+            for w in labels
+        ):
             continue
 
-        if (
-            panel.left - 12 <= word.cx <= panel.right + 12
-            and panel.bottom - 5 <= word.top
-            <= panel.bottom + max(45, 0.13 * height)
+        box = clip((
+            center - half_width,
+            y0,
+            center + half_width,
+            y1,
+        ), gray.shape)
+        readings = numeric_readings(gray, box)
+        matches = [
+            text for text in readings
+            if math.isclose(
+                number(text),
+                slope * center + intercept,
+                rel_tol=0,
+                abs_tol=tolerance,
+            )
+        ]
+
+        if not matches:
+            unread += 1
+            continue
+
+        text = max(
+            sorted(set(matches)),
+            key=matches.count,
+        )
+        x0, by0, x1, by1 = box
+        image = gray[by0:by1, x0:x1]
+        if image.size == 0:
+            continue
+
+        count, labels_image, stats, _ = (
+            cv2.connectedComponentsWithStats(
+                threshold_ink(image)
+            )
+        )
+        mask = np.zeros(image.shape, bool)
+
+        for i in range(1, count):
+            if stats[i, cv2.CC_STAT_AREA] >= 3:
+                mask |= labels_image == i
+
+        ys, xs = np.nonzero(mask)
+        if not len(xs):
+            continue
+
+        lx = x0 + int(xs.min())
+        ty = by0 + int(ys.min())
+        rx = x0 + int(xs.max()) + 1
+        by = by0 + int(ys.max()) + 1
+
+        additions.append(Word(
+            text,
+            50.0 + 5.0 * matches.count(text),
+            lx,
+            ty,
+            rx - lx,
+            by - ty,
+        ))
+
+    if unread:
+        print(
+            f"Warning: {unread} candidate bottom-label position(s) "
+            "were unread; no labels were synthesized.",
+            file=sys.stderr,
+        )
+
+    if not additions:
+        return labels
+
+    selected = consistent_sequence(
+        labels + additions,
+        True,
+    )
+    return selected if len(selected) >= len(labels) else labels
+
+
+def in_right_region(word, bounds):
+    return (
+        word.cx >= bounds[2]
+        and word.bottom >= bounds[1] - AXIS_SEARCH_PADDING
+        and word.top <= bounds[3] + AXIS_SEARCH_PADDING
+    )
+
+
+def find_numeric_column(words, bounds, width):
+    anchors = [
+        w for w in words
+        if in_right_region(w, bounds)
+        and w.confidence >= ANCHOR_MIN_CONFIDENCE
+        and re.fullmatch(PLAIN, normalize(w.text))
+        and "." in normalize(w.text)
+        and w.height <= 2.5 * max(1, w.width)
+    ]
+    choices = []
+
+    for anchor in anchors:
+        group = [
+            w for w in anchors
+            if abs(w.left - anchor.left)
+            <= max(12, anchor.height)
+        ]
+        rows = []
+        for word in sorted(group, key=lambda w: w.cy):
+            if not rows or abs(word.cy - rows[-1]) > 10:
+                rows.append(word.cy)
+
+        if len(rows) >= 2:
+            choices.append((
+                float(np.median([w.left for w in group])),
+                -len(rows),
+                group,
+            ))
+
+    if not choices:
+        raise ValueError(
+            "Need two confident aligned right-axis decimal labels."
+        )
+
+    anchors = unique_words(
+        min(
+            choices,
+            key=lambda value: (value[0], value[1]),
+        )[2]
+    )
+    distinct = []
+
+    for word in sorted(anchors, key=lambda w: -w.confidence):
+        if not any(
+            abs(word.cy - old.cy) < 10
+            for old in distinct
         ):
-            x_samples.append((word.cx, value))
+            distinct.append(word)
+
+    anchors = sorted(distinct, key=lambda w: w.cy)
+    height = max(
+        10.0,
+        float(np.median([w.height for w in anchors])),
+    )
+
+    return (
+        max(
+            bounds[2] + 1,
+            min(w.left for w in anchors) - COLUMN_PADDING,
+        ),
+        min(
+            width,
+            max(w.right for w in anchors) + COLUMN_PADDING,
+        ),
+        height,
+        anchors,
+    )
+
+
+def propose_rows(words, bounds, column, anchors):
+    x0, x1, height = column
+    rows = []
+
+    def add(y):
+        if (
+            bounds[1] - AXIS_SEARCH_PADDING
+            <= y <= bounds[3] + AXIS_SEARCH_PADDING
+            and not any(
+                abs(y - old) < 0.7 * height
+                for old in rows
+            )
+        ):
+            rows.append(float(y))
+
+    for word in anchors:
+        add(word.cy)
+
+    spacing = float(np.median(
+        np.diff([w.cy for w in anchors])
+    ))
+    if spacing > 2 * height:
+        reference = anchors[0].cy
+        first = math.ceil(
+            (
+                bounds[1]
+                - AXIS_SEARCH_PADDING
+                - reference
+            ) / spacing
+        )
+        last = math.floor(
+            (
+                bounds[3]
+                + AXIS_SEARCH_PADDING
+                - reference
+            ) / spacing
+        )
+        for index in range(first, last + 1):
+            add(reference + index * spacing)
+
+    for word in sorted(words, key=lambda w: -w.confidence):
+        if (
+            in_right_region(word, bounds)
+            and x0 <= word.cx <= x1
+            and word.height <= 2.5 * height
+        ):
+            add(word.cy)
+
+    add(bounds[3])
+    return sorted(rows)
+
+
+def nearest_ink_box(gray, box, center, height):
+    x0, y0, x1, y1 = clip(box, gray.shape)
+    image = gray[y0:y1, x0:x1]
+    if image.size == 0:
+        return None
+
+    count, labels, stats, _ = (
+        cv2.connectedComponentsWithStats(
+            threshold_ink(image)
+        )
+    )
+    mask = np.zeros(image.shape, bool)
+
+    for i in range(1, count):
+        if stats[i, cv2.CC_STAT_AREA] >= 3:
+            mask |= labels == i
+
+    occupied = np.flatnonzero(mask.any(axis=1))
+    if not len(occupied):
+        return None
+
+    groups = np.split(
+        occupied,
+        np.flatnonzero(
+            np.diff(occupied)
+            > max(2, round(0.18 * height))
+        ) + 1,
+    )
+    candidates = []
+
+    for group in groups:
+        top = int(group[0])
+        bottom = int(group[-1]) + 1
+        _, xs = np.nonzero(mask[top:bottom])
+        if not len(xs):
+            continue
+
+        result = (
+            x0 + int(xs.min()),
+            y0 + top,
+            x0 + int(xs.max()) + 1,
+            y0 + bottom,
+        )
+        offset = abs(
+            (result[1] + result[3]) / 2 - center
+        )
 
         if (
-            panel.top - 12 <= word.cy <= panel.bottom + 12
-            and panel.left - max(80, 0.16 * width)
-            <= word.left + word.width <= panel.left + 8
+            bottom - top <= 1.8 * height
+            and offset <= 0.90 * height
         ):
-            y_samples.append((word.cy, value))
+            candidates.append((
+                offset,
+                -(bottom - top),
+                result,
+            ))
 
-    errors, fits = [], {}
-    for name, samples, increasing in (
-        ("x", x_samples, True),
-        ("y", y_samples, False),
-    ):
-        try:
-            fits[name] = fit_axis(samples, increasing)
-        except ValueError as error:
-            errors.append(f"{name}-axis: {error}")
-
-    if errors:
-        raise ValueError("; ".join(errors))
-    return fits["x"], fits["y"]
+    return (
+        min(
+            candidates,
+            key=lambda value: (value[0], value[1]),
+        )[2]
+        if candidates else None
+    )
 
 
-# ----------------------------------------------------------------------
-# Curve discovery and tracing
-# ----------------------------------------------------------------------
+def read_label_rows(gray, rows, column, anchors):
+    x0, x1, height = column
+    candidates = list(anchors)
 
-def tracing_ink(ink, mask, words):
-    result = ink & ~mask
-    for word in words:
-        x0 = max(0, word.left - 1)
-        y0 = max(0, word.top - 1)
-        x1 = min(ink.shape[1], word.left + word.width + 1)
-        y1 = min(ink.shape[0], word.top + word.height + 1)
-        result[y0:y1, x0:x1] = False
-    return result
+    for center in rows:
+        broad = clip((
+            x0,
+            center - ROW_HALF_HEIGHT_FACTOR * height,
+            x1,
+            center + ROW_HALF_HEIGHT_FACTOR * height,
+        ), gray.shape)
+        found = numeric_readings(gray, broad)
+        box = nearest_ink_box(
+            gray,
+            broad,
+            center,
+            height,
+        )
+
+        if box is None:
+            box = broad
+        else:
+            left, top, right, bottom = box
+            found += numeric_readings(
+                gray,
+                (left - 3, top - 3, right + 3, bottom + 3),
+            )
+
+        left, top, right, bottom = box
+        for text in set(found):
+            candidates.append(Word(
+                text,
+                40 + 5 * found.count(text),
+                left,
+                top,
+                max(1, right - left),
+                max(1, bottom - top),
+            ))
+
+    return unique_words(candidates)
+
+
+def detect_title_box(gray, bounds, top_band):
+    image = gray.copy()
+    x0, y0, x1, y1 = top_band
+    image[y0:y1, x0:x1] = 255
+
+    x0, y0, x1, y1 = clip((
+        bounds[2] + 1,
+        bounds[1] - AXIS_SEARCH_PADDING,
+        gray.shape[1],
+        bounds[3] + AXIS_SEARCH_PADDING,
+    ), gray.shape)
+    region = image[y0:y1, x0:x1]
+    if region.size == 0:
+        return None
+
+    rotated = cv2.rotate(
+        region,
+        cv2.ROTATE_90_CLOCKWISE,
+    )
+    boxes = []
+
+    for word in read_words(rotated):
+        if not re.search(r"[A-Za-z]{3,}", word.text):
+            continue
+
+        box = (
+            x0 + word.top,
+            y0 + region.shape[0] - word.right,
+            x0 + word.bottom,
+            y0 + region.shape[0] - word.left,
+        )
+        if not intersection(box, top_band):
+            boxes.append(box)
+
+    if not boxes:
+        return None
+
+    return clip((
+        min(b[0] for b in boxes) - TITLE_PADDING,
+        min(b[1] for b in boxes) - TITLE_PADDING,
+        max(b[2] for b in boxes) + TITLE_PADDING,
+        max(b[3] for b in boxes) + TITLE_PADDING,
+    ), gray.shape)
+
+
+def grid_nodes(length, spacing):
+    step = max(
+        8.0,
+        GRID_NODE_INTERVALS * spacing,
+    )
+    count = max(
+        3,
+        int(math.ceil((length - 1) / step)) + 1,
+    )
+    return np.linspace(
+        0,
+        length - 1,
+        count,
+    )
+
+
+def measure_grid_offsets(
+    stripe,
+    references,
+    nodes,
+    along_spacing,
+    across_spacing,
+    max_search,
+    prior=None,
+):
+    across_length, along_length = stripe.shape
+    limit = min(
+        max_search,
+        GRID_MAX_SPACING_FRACTION * across_spacing,
+    )
+    values = np.zeros(
+        (len(references), len(nodes)),
+        float,
+    )
+    weights = np.zeros_like(values)
+
+    if limit < 1 or len(references) == 0:
+        return values, weights, limit
+
+    if prior is None:
+        prior = np.zeros_like(values)
+        radius = limit
+    else:
+        radius = min(
+            limit,
+            max(2.0, 0.20 * across_spacing),
+        )
+
+    half_window = max(
+        6,
+        int(round(
+            0.5 * GRID_WINDOW_INTERVALS * along_spacing
+        )),
+    )
+    offsets = np.arange(
+        -math.floor(radius),
+        math.floor(radius) + 1,
+        dtype=float,
+    )
+    slopes = np.linspace(
+        -GRID_MAX_LOCAL_SLOPE,
+        GRID_MAX_LOCAL_SLOPE,
+        GRID_SLOPE_SAMPLES,
+    )
+
+    for i, reference in enumerate(references):
+        if (
+            reference < limit + 2
+            or reference > across_length - limit - 3
+        ):
+            continue
+
+        for j, node in enumerate(nodes):
+            a = max(
+                2,
+                int(round(node)) - half_window,
+            )
+            b = min(
+                along_length - 2,
+                int(round(node)) + half_window + 1,
+            )
+            if b - a < max(8, half_window):
+                continue
+
+            columns = np.arange(a, b, 2, dtype=int)
+            along = columns.astype(float)
+            relative = along - node
+            base = np.interp(
+                along,
+                nodes,
+                prior[i],
+            )
+            center_prior = float(prior[i, j])
+            scores = np.full(
+                len(offsets),
+                -np.inf,
+            )
+
+            for k, offset in enumerate(offsets):
+                if abs(center_prior + offset) > limit:
+                    continue
+
+                displacement = (
+                    base[None, :]
+                    + offset
+                    + slopes[:, None] * relative[None, :]
+                )
+                rows = reference + displacement
+                valid = (
+                    (np.abs(displacement) <= limit)
+                    & (rows >= 1)
+                    & (rows < across_length - 2)
+                )
+                counts = valid.sum(axis=1)
+                usable = counts >= 0.85 * len(columns)
+                if not np.any(usable):
+                    continue
+
+                safe = np.clip(
+                    rows,
+                    0,
+                    across_length - 2,
+                )
+                lower = np.floor(safe).astype(np.intp)
+                fraction = safe - lower
+                samples = (
+                    (1.0 - fraction) * stripe[lower, columns]
+                    + fraction * stripe[lower + 1, columns]
+                )
+                support = np.sum(
+                    np.where(valid, samples, 0.0),
+                    axis=1,
+                ) / np.maximum(counts, 1)
+                support[~usable] = -np.inf
+                scores[k] = float(support.max())
+
+            finite = np.isfinite(scores)
+            if np.count_nonzero(finite) < 3:
+                continue
+
+            peak = float(scores[finite].max())
+            baseline = float(np.median(scores[finite]))
+            contrast = peak - baseline
+            if (
+                peak < GRID_MIN_SUPPORT
+                or contrast < GRID_MIN_CONTRAST
+            ):
+                continue
+
+            best = int(np.argmax(scores))
+            if (
+                best == 0
+                or best == len(scores) - 1
+                or not finite[best - 1]
+                or not finite[best + 1]
+            ):
+                continue
+
+            cutoff = baseline + 0.65 * contrast
+            lo = hi = best
+            while lo > 0 and scores[lo - 1] >= cutoff:
+                lo -= 1
+            while (
+                hi + 1 < len(scores)
+                and scores[hi + 1] >= cutoff
+            ):
+                hi += 1
+
+            if (
+                lo == 0
+                or hi == len(scores) - 1
+                or not finite[lo - 1]
+                or not finite[hi + 1]
+            ):
+                continue
+
+            outside = finite.copy()
+            outside[
+                max(0, lo - 1):min(len(scores), hi + 2)
+            ] = False
+            competing = (
+                float(scores[outside].max())
+                if outside.any() else baseline
+            )
+            margin = peak - competing
+            if margin < GRID_MIN_PEAK_MARGIN:
+                continue
+
+            selected = np.arange(lo, hi + 1)
+            mass = np.maximum(
+                scores[selected] - baseline,
+                1e-9,
+            )
+            correction = float(np.average(
+                offsets[selected],
+                weights=mass,
+            ))
+            values[i, j] = center_prior + correction
+            weights[i, j] = min(
+                1.0,
+                max(
+                    0.05,
+                    peak * min(1.0, margin / 0.15),
+                ),
+            )
+
+    return values, weights, limit
+
+
+def solve_displacement(values, weights, initial=None):
+    if values.size == 0 or not np.any(weights):
+        return np.zeros_like(values)
+
+    def apply(field):
+        result = (
+            weights + GRID_REFERENCE_WEIGHT
+        ) * field
+
+        along = field[:, 1:] - field[:, :-1]
+        result[:, :-1] -= GRID_ALONG_SMOOTHNESS * along
+        result[:, 1:] += GRID_ALONG_SMOOTHNESS * along
+
+        across = field[1:, :] - field[:-1, :]
+        result[:-1, :] -= GRID_ACROSS_SMOOTHNESS * across
+        result[1:, :] += GRID_ACROSS_SMOOTHNESS * across
+        return result
+
+    diagonal = (
+        weights + GRID_REFERENCE_WEIGHT
+    ).copy()
+    diagonal[:, :-1] += GRID_ALONG_SMOOTHNESS
+    diagonal[:, 1:] += GRID_ALONG_SMOOTHNESS
+    diagonal[:-1, :] += GRID_ACROSS_SMOOTHNESS
+    diagonal[1:, :] += GRID_ACROSS_SMOOTHNESS
+
+    rhs = weights * values
+    field = (
+        np.zeros_like(values)
+        if initial is None else initial.copy()
+    )
+    residual = rhs - apply(field)
+    z = residual / diagonal
+    direction = z.copy()
+    rz = float(np.sum(residual * z))
+    tolerance = 1e-7 * max(
+        1.0,
+        float(np.linalg.norm(rhs)),
+    )
+
+    for _ in range(GRID_CG_ITERATIONS):
+        if float(np.linalg.norm(residual)) <= tolerance:
+            break
+
+        product = apply(direction)
+        denominator = float(np.sum(direction * product))
+        if denominator <= 0 or rz <= 0:
+            break
+
+        alpha = rz / denominator
+        field += alpha * direction
+        residual -= alpha * product
+        z = residual / diagonal
+        new_rz = float(np.sum(residual * z))
+        if new_rz <= 0:
+            break
+
+        direction = z + (new_rz / rz) * direction
+        rz = new_rz
+
+    return field
+
+
+def robust_grid_fit(values, weights, limit, initial=None):
+    fitted = solve_displacement(
+        values,
+        weights,
+        initial,
+    )
+    adjusted = weights.copy()
+
+    if np.any(weights):
+        residual = np.abs(values - fitted)
+        scale = max(
+            1.0,
+            0.15 * limit,
+        )
+        large = residual > scale
+        adjusted[large] *= (
+            scale / residual[large]
+        ) ** 2
+        fitted = solve_displacement(
+            values,
+            adjusted,
+            initial=fitted,
+        )
+
+    return np.clip(fitted, -limit, limit), adjusted
+
+
+def fit_grid_family(
+    ink,
+    references,
+    along_spacing,
+    across_spacing,
+    max_search,
+):
+    nodes = grid_nodes(
+        ink.shape[1],
+        along_spacing,
+    )
+    stripe = cv2.blur(
+        ink.astype(np.float32),
+        (1, 3),
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    v1, w1, limit = measure_grid_offsets(
+        stripe,
+        references,
+        nodes,
+        along_spacing,
+        across_spacing,
+        max_search,
+    )
+    f1, w1 = robust_grid_fit(
+        v1,
+        w1,
+        limit,
+    )
+    v2, w2, _ = measure_grid_offsets(
+        stripe,
+        references,
+        nodes,
+        along_spacing,
+        across_spacing,
+        max_search,
+        prior=f1,
+    )
+
+    retained = w1.copy()
+    retained[w2 > 0] *= 0.35
+    weights = retained + w2
+    values = np.divide(
+        retained * v1 + w2 * v2,
+        weights,
+        out=np.zeros_like(v1),
+        where=weights > 0,
+    )
+    fitted, weights = robust_grid_fit(
+        values,
+        weights,
+        limit,
+        initial=f1,
+    )
+
+    along = np.arange(
+        ink.shape[1],
+        dtype=float,
+    )
+    paths, measurements = [], []
+
+    for i, reference in enumerate(references):
+        displacement = np.interp(
+            along,
+            nodes,
+            fitted[i],
+        )
+        if i == 0 or i == len(references) - 1:
+            displacement = np.zeros_like(displacement)
+
+        paths.append(np.column_stack((
+            along,
+            reference + displacement,
+        )))
+
+        for j in np.flatnonzero(weights[i] >= 0.05):
+            measurements.append((
+                float(nodes[j]),
+                float(reference + values[i, j]),
+            ))
+
+    return (
+        paths,
+        measurements,
+        int(np.count_nonzero(weights >= 0.05)),
+        int(weights.size),
+    )
+
+
+def generate_grid(
+    ink,
+    bounds,
+    bottom,
+    right,
+    max_search,
+    straight=False,
+):
+    reference = fit_reference_grid(
+        bottom,
+        right,
+        bounds,
+    )
+    validate_reference_grid(reference)
+
+    left, top, end, bottom_y = bounds
+    width = end - left + 1
+    height = bottom_y - top + 1
+
+    xs = np.linspace(
+        0.0,
+        float(end - left),
+        reference.minor_intervals_x + 1,
+    )
+    ys = np.linspace(
+        0.0,
+        float(bottom_y - top),
+        reference.minor_intervals_y + 1,
+    )
+    local_ink = ink[
+        top:bottom_y + 1,
+        left:end + 1,
+    ]
+    measurements = []
+    accepted = attempted = 0
+
+    if straight:
+        horizontal = [
+            np.column_stack((
+                np.arange(width, dtype=float),
+                np.full(width, y),
+            ))
+            for y in ys
+        ]
+        vertical = [
+            np.column_stack((
+                np.full(height, x),
+                np.arange(height, dtype=float),
+            ))
+            for x in xs
+        ]
+    else:
+        hp, hm, ha, ht = fit_grid_family(
+            local_ink,
+            ys,
+            reference.minor_x,
+            reference.minor_y,
+            max_search,
+        )
+        vp, vm, va, vt = fit_grid_family(
+            local_ink.T,
+            xs,
+            reference.minor_y,
+            reference.minor_x,
+            max_search,
+        )
+        horizontal = hp
+        vertical = [
+            path[:, ::-1].copy() for path in vp
+        ]
+        measurements.extend(
+            (x + left, y + top) for x, y in hm
+        )
+        measurements.extend(
+            (x + left, y + top) for y, x in vm
+        )
+        accepted, attempted = ha + va, ht + vt
+
+    origin = np.array([left, top])
+    horizontal = [
+        path + origin for path in horizontal
+    ]
+    vertical = [
+        path + origin for path in vertical
+    ]
+
+    local_mask = np.zeros(
+        (height, width),
+        np.uint8,
+    )
+    for path in horizontal + vertical:
+        cv2.polylines(
+            local_mask,
+            [np.rint(path - origin).astype(np.int32)],
+            False,
+            255,
+            MASK_WIDTH,
+            lineType=cv2.LINE_8,
+        )
+
+    cv2.rectangle(
+        local_mask,
+        (0, 0),
+        (width - 1, height - 1),
+        255,
+        MASK_WIDTH,
+    )
+
+    mask = np.zeros(
+        ink.shape,
+        bool,
+    )
+    mask[
+        top:bottom_y + 1,
+        left:end + 1,
+    ] = local_mask > 0
+
+    grid = GridFit(
+        mask,
+        horizontal,
+        vertical,
+        measurements,
+        accepted,
+        attempted,
+        reference,
+    )
+    references = [
+        np.array(
+            [[left, top + y], [end, top + y]],
+            float,
+        )
+        for y in ys
+    ] + [
+        np.array(
+            [[left + x, top], [left + x, bottom_y]],
+            float,
+        )
+        for x in xs
+    ]
+
+    return grid, references
+
+
+def grid_fit_preview(base, bounds, grid, references):
+    image = base.copy()
+
+    for path in references:
+        cv2.polylines(
+            image,
+            [np.rint(path).astype(np.int32)],
+            False,
+            (255, 80, 0),
+            1,
+        )
+    for path in grid.horizontal + grid.vertical:
+        cv2.polylines(
+            image,
+            [np.rint(path).astype(np.int32)],
+            False,
+            (0, 180, 0),
+            1,
+        )
+    for x, y in grid.measurements:
+        cv2.circle(
+            image,
+            (round(x), round(y)),
+            2,
+            (0, 140, 255),
+            -1,
+        )
+
+    draw_frame(image, bounds)
+    return image
+
+
+def fit_axis(labels, horizontal, multiplier=1):
+    positions = np.array([
+        w.cx if horizontal else w.cy
+        for w in labels
+    ])
+    values = np.array(
+        [number(w.text) for w in labels],
+        float,
+    ) * multiplier
+
+    return np.polyfit(
+        positions,
+        values,
+        1,
+    )
 
 
 def run_centers(column):
     rows = np.flatnonzero(column)
     if not len(rows):
-        return np.array([], dtype=float)
+        return np.array([], float)
+
     groups = np.split(
-        rows, np.flatnonzero(np.diff(rows) > 1) + 1
+        rows,
+        np.flatnonzero(np.diff(rows) > 1) + 1,
     )
-    return np.array(
-        [group.mean() for group in groups if len(group) <= 12],
-        dtype=float,
+    return np.array([
+        group.mean()
+        for group in groups
+        if len(group) <= 12
+    ])
+
+
+def column_candidates(clean, bounds, x):
+    _, top, _, bottom = bounds
+    return (
+        run_centers(
+            clean[top + 2:bottom - 1, x]
+        )
+        + top
+        + 2
     )
 
 
-def choose_seeds(clean, panel, expected=None):
-    margin = max(6, (panel.bottom - panel.top) // 100)
-    left, right = panel.left + margin, panel.right - margin
-    top, bottom = panel.top + margin, panel.bottom - margin
+def tags_for_count(count):
+    if count == 7:
+        return [
+            str(value) for value in range(7, 0, -1)
+        ]
+    return [
+        f"{6.5 - 0.5 * i:g}" for i in range(12)
+    ]
 
-    if right <= left or bottom <= top:
-        raise ValueError("Detected section is too small.")
 
+def choose_seeds(
+    clean,
+    bounds,
+    requested_count=None,
+    high_speed=False,
+):
+    left, top, right, bottom = bounds
+    margin = max(
+        6,
+        (bottom - top) // 100,
+    )
+    allowed = (
+        (requested_count,)
+        if requested_count is not None
+        else (7, 12)
+    )
     choices = []
-    for x in np.linspace(left, right, 120).astype(int):
-        centers = run_centers(clean[top:bottom + 1, x]) + top
+
+    for x in np.linspace(
+        left + margin,
+        right - margin,
+        180,
+    ).astype(int):
+        centers = (
+            run_centers(
+                clean[
+                    top + margin:bottom - margin + 1,
+                    x,
+                ]
+            )
+            + top
+            + margin
+        )
+
         separated = []
         for y in centers:
             if not separated or y - separated[-1] >= 5:
                 separated.append(float(y))
-        if 2 <= len(separated) <= 20:
-            choices.append((int(x), np.array(separated)))
+
+        if len(separated) in allowed:
+            choices.append((
+                int(x),
+                np.array(separated),
+            ))
 
     if not choices:
-        raise ValueError("No plausible curve-seed columns.")
+        return None
 
-    if expected is None:
-        votes = {
-            count: sum(len(ys) == count for _, ys in choices)
-            for count in (7, 12)
-        }
-        expected = max(votes, key=votes.get)
-        if votes[expected] < 3:
-            raise ValueError(
-                "Could not identify a seven- or twelve-curve section."
+    count = max(
+        allowed,
+        key=lambda n: sum(
+            len(ys) == n for _, ys in choices
+        ),
+    )
+    choices = [
+        value for value in choices
+        if len(value[1]) == count
+    ]
+
+    if high_speed:
+        earliest = min(value[0] for value in choices)
+        band = max(
+            5,
+            int(0.03 * (right - left)),
+        )
+        choices = [
+            value for value in choices
+            if value[0] <= earliest + band
+        ]
+
+    return max(
+        choices,
+        key=lambda value: (
+            float(np.min(np.diff(value[1])))
+            + 5 * min(
+                value[0] - left,
+                right - value[0],
+            ) / max(1, right - left)
+        ),
+    )
+
+
+def assignment_gates(predicted):
+    if len(predicted) == 1:
+        return np.array(
+            [ASSIGN_MAX_GATE],
+            float,
+        )
+
+    distances = np.maximum(
+        np.diff(predicted),
+        1.0,
+    )
+    local = np.full(
+        len(predicted),
+        float(np.median(distances)),
+    )
+    local[:-1] = np.minimum(
+        local[:-1],
+        distances,
+    )
+    local[1:] = np.minimum(
+        local[1:],
+        distances,
+    )
+
+    return np.clip(
+        0.45 * local,
+        ASSIGN_MIN_GATE,
+        ASSIGN_MAX_GATE,
+    )
+
+
+def ordered_assignment(
+    predicted,
+    candidates,
+    gates,
+    lower=None,
+    upper=None,
+):
+    predicted = np.asarray(predicted, float)
+    candidates = np.asarray(candidates, float)
+    count, total = len(predicted), len(candidates)
+    assigned = np.full(count, np.nan)
+
+    if count == 0:
+        return assigned, 0.0
+    if total == 0:
+        return assigned, count * ASSIGN_MISSING_COST
+
+    if lower is None:
+        lower = np.full(count, -np.inf)
+    if upper is None:
+        upper = np.full(count, np.inf)
+
+    cost = np.full(
+        (count + 1, total + 1),
+        np.inf,
+    )
+    action = np.zeros(
+        (count + 1, total + 1),
+        np.uint8,
+    )
+    cost[0, :] = 0.0
+
+    for i in range(1, count + 1):
+        cost[i, 0] = i * ASSIGN_MISSING_COST
+        action[i, 0] = 2
+
+    for i in range(1, count + 1):
+        for j in range(1, total + 1):
+            best, operation = cost[i, j - 1], 1
+            missing = (
+                cost[i - 1, j] + ASSIGN_MISSING_COST
             )
+            if missing < best:
+                best, operation = missing, 2
+
+            candidate = candidates[j - 1]
+            distance = abs(
+                predicted[i - 1] - candidate
+            )
+
+            if (
+                distance <= gates[i - 1]
+                and lower[i - 1]
+                <= candidate
+                <= upper[i - 1]
+            ):
+                matched = (
+                    cost[i - 1, j - 1]
+                    + (distance / gates[i - 1]) ** 2
+                )
+                if matched < best:
+                    best, operation = matched, 3
+
+            cost[i, j] = best
+            action[i, j] = operation
+
+    i, j = count, total
+    while i > 0:
+        operation = action[i, j]
+        if operation == 3:
+            assigned[i - 1] = candidates[j - 1]
+            i -= 1
+            j -= 1
+        elif operation == 2:
+            i -= 1
+        elif j > 0:
+            j -= 1
+        else:
+            break
+
+    return assigned, float(cost[count, total])
+
+
+def visible_assignment(
+    predicted,
+    candidates,
+    bounds,
+    tolerance=None,
+    allowed=None,
+    reject_ambiguous=False,
+):
+    _, top, _, bottom = bounds
+    visible = (
+        np.isfinite(predicted)
+        & (predicted >= top + 2)
+        & (predicted <= bottom - 2)
+    )
+    if allowed is not None:
+        visible &= allowed
+
+    active = np.flatnonzero(visible)
+    result = np.full(
+        len(predicted),
+        np.nan,
+    )
+
+    if reject_ambiguous and len(active) > 1:
+        close = (
+            np.diff(predicted[active])
+            < MIN_DISTINCT_STROKE_SEPARATION
+        )
+        ambiguous = np.zeros(
+            len(active),
+            bool,
+        )
+        ambiguous[:-1] |= close
+        ambiguous[1:] |= close
+        active = active[~ambiguous]
+
+    if not len(active):
+        return result, 0.0, 0
+
+    gates = (
+        assignment_gates(predicted[active])
+        if tolerance is None
+        else np.full(len(active), tolerance)
+    )
+    assigned, cost = ordered_assignment(
+        predicted[active],
+        candidates,
+        gates,
+    )
+    result[active] = assigned
+
+    return result, cost, len(active)
+
+
+def ordered_initial_positions(values, weights):
+    """
+    Weighted isotonic projection for initialization only.
+
+    This adjusts model guesses, never measured image observations.
+    """
+    index = np.arange(
+        len(values),
+        dtype=float,
+    )
+    shifted = (
+        np.asarray(values, float)
+        - SPLINE_MIN_SEPARATION * index
+    )
+    blocks = []
+
+    for i, (value, weight) in enumerate(zip(shifted, weights)):
+        blocks.append([
+            i,
+            i + 1,
+            float(weight),
+            float(value),
+        ])
+        while (
+            len(blocks) >= 2
+            and blocks[-2][3] > blocks[-1][3]
+        ):
+            b = blocks.pop()
+            a = blocks.pop()
+            weight_sum = a[2] + b[2]
+            mean = (
+                a[2] * a[3] + b[2] * b[3]
+            ) / weight_sum
+            blocks.append([
+                a[0],
+                b[1],
+                weight_sum,
+                mean,
+            ])
+
+    result = np.empty(
+        len(values),
+        float,
+    )
+    for start, end, _, mean in blocks:
+        result[start:end] = mean
+
+    return (
+        result
+        + SPLINE_MIN_SEPARATION * index
+    )
+
+
+def robust_local_line(xs, ys, join_x):
+    valid = np.isfinite(ys)
+    x = (
+        np.asarray(xs[valid], float)
+        - join_x
+    )
+    y = np.asarray(ys[valid], float)
+
+    if len(x) < JOIN_STRIP_MIN_POINTS or np.ptp(x) < 4:
+        return None
+
+    design = np.column_stack((
+        np.ones(len(x)),
+        x,
+    ))
+    weights = np.ones(len(x))
+    coefficients = np.zeros(2)
+
+    for _ in range(3):
+        coefficients = np.linalg.lstsq(
+            design * np.sqrt(weights)[:, None],
+            y * np.sqrt(weights),
+            rcond=None,
+        )[0]
+        residual = y - design @ coefficients
+        scale = max(
+            1.0,
+            1.4826 * float(np.median(
+                np.abs(
+                    residual - np.median(residual)
+                )
+            )),
+        )
+        weights = 1.0 / np.sqrt(
+            1.0
+            + (residual / (2.0 * scale)) ** 2
+        )
+
+    residual = y - design @ coefficients
+    if float(np.median(np.abs(residual))) > 3.0:
+        return None
+
+    center = float(np.mean(x))
+    spread = float(np.sum((x - center) ** 2))
+    leverage = (
+        1.0 / len(x)
+        + center * center / max(spread, 1.0)
+    )
+    sigma = max(
+        1.5,
+        scale * math.sqrt(leverage),
+    )
+
+    return (
+        float(coefficients[0]),
+        float(coefficients[1]),
+        sigma,
+    )
+
+
+def recover_high_join_strip(
+    clean,
+    bounds,
+    join_pixel,
+    initial_pixels,
+    major_spacing,
+    print_sigma_pixels,
+):
+    left, _, right, _ = bounds
+    width = int(np.clip(
+        JOIN_STRIP_MAJOR_FRACTION * major_spacing,
+        JOIN_STRIP_MIN_WIDTH,
+        JOIN_STRIP_MAX_WIDTH,
+    ))
+    first = max(
+        left + 2,
+        int(math.ceil(join_pixel)),
+    )
+    last = min(
+        right - 2,
+        first + width,
+    )
+    xs = np.arange(
+        first,
+        last + 1,
+        2,
+        dtype=int,
+    )
+
+    if len(xs) < JOIN_STRIP_MIN_POINTS:
+        return (
+            xs,
+            np.full(
+                (len(initial_pixels), len(xs)),
+                np.nan,
+            ),
+            np.full(len(initial_pixels), np.nan),
+            np.zeros(len(initial_pixels)),
+            np.full(len(initial_pixels), np.nan),
+        )
 
     candidates = [
-        item for item in choices if len(item[1]) == expected
+        column_candidates(clean, bounds, int(x))
+        for x in xs
     ]
-    if len(candidates) < 3:
-        raise ValueError(
-            f"Too few columns contain {expected} curve candidates."
+    intercepts = initial_pixels.copy()
+    slopes = np.zeros(len(intercepts))
+    observations = np.full(
+        (len(intercepts), len(xs)),
+        np.nan,
+    )
+    estimated = np.full(
+        len(intercepts),
+        np.nan,
+    )
+    sigmas = np.full(
+        len(intercepts),
+        np.nan,
+    )
+
+    separation = float(np.median(
+        np.maximum(
+            np.diff(initial_pixels),
+            1.0,
         )
-
-    def score(item):
-        x, ys = item
-        separation = float(np.min(np.diff(ys)))
-        centrality = min(x - left, right - x) / max(1, right - left)
-        return separation + 5 * centrality
-
-    return max(candidates, key=score)
-
-
-def trace_curve(clean, panel, seed_x, seed_y):
-    max_gap = max(
-        15, min(80, int(0.06 * (panel.right - panel.left)))
-    )
-    search = max(
-        5, min(16, (panel.bottom - panel.top) // 65)
+    ))
+    search_radius = min(
+        max(
+            8.0,
+            2.0 * print_sigma_pixels
+            + JOIN_PIXEL_TOLERANCE,
+        ),
+        max(
+            8.0,
+            0.8 * separation,
+        ),
     )
 
-    def follow(direction):
-        observations = [(seed_x, float(seed_y))]
-        path = [(seed_x, float(seed_y), True)]
-        gap = 0
-        stop = panel.left - 1 if direction < 0 else panel.right + 1
+    for _ in range(JOIN_STRIP_PASSES):
+        observations[:] = np.nan
 
-        for x in range(seed_x + direction, stop, direction):
-            last_x, last_y = observations[-1]
-            recent = observations[-10:]
-            slope = 0.0
-
-            if len(recent) >= 3:
-                xs = np.array([p[0] for p in recent], float)
-                ys = np.array([p[1] for p in recent], float)
-                slope = float(
-                    np.polyfit(xs - xs.mean(), ys, 1)[0]
-                )
-
-            slope = float(np.clip(slope, -3, 3))
-            predicted = last_y + slope * (x - last_x)
-            lo = max(panel.top + 2, int(predicted) - search)
-            hi = min(panel.bottom - 1, int(predicted) + search + 1)
-
-            candidates = (
-                run_centers(clean[lo:hi, x]) + lo
-                if hi > lo else np.array([])
+        for j, x in enumerate(xs):
+            prediction = (
+                intercepts + slopes * (x - join_pixel)
+            )
+            prediction = ordered_initial_positions(
+                prediction,
+                np.ones(len(prediction)),
+            )
+            observations[:, j], _, _ = visible_assignment(
+                prediction,
+                candidates[j],
+                bounds,
+                tolerance=search_radius,
             )
 
-            if not len(candidates):
-                gap += 1
-                if gap > max_gap:
-                    break
+        proposed = initial_pixels.copy()
+        proposed_slopes = np.zeros(len(intercepts))
+        proposed_sigmas = np.full(
+            len(intercepts),
+            np.nan,
+        )
+        estimated[:] = np.nan
+        weights = np.ones(len(intercepts))
+
+        for k in range(len(intercepts)):
+            fit = robust_local_line(
+                xs,
+                observations[k],
+                join_pixel,
+            )
+            if fit is None:
                 continue
 
-            y = float(
-                candidates[np.argmin(abs(candidates - predicted))]
-            )
+            value, slope, sigma = fit
+            estimated[k] = value
+            proposed[k] = value
+            proposed_slopes[k] = slope
+            proposed_sigmas[k] = sigma
+            weights[k] = 4.0
 
-            if gap:
-                for missing_x in range(last_x + direction, x, direction):
-                    fraction = (missing_x - last_x) / (x - last_x)
-                    path.append((
-                        missing_x,
-                        last_y + fraction * (y - last_y),
-                        False,
-                    ))
-
-            path.append((x, y, True))
-            observations.append((x, y))
-            observations = observations[-10:]
-            gap = 0
-
-        return path
-
-    return list(reversed(follow(-1))) + follow(1)[1:]
-
-
-def validate_order(traces):
-    for upper, lower in zip(traces, traces[1:]):
-        upper_map = {x: y for x, y, _ in upper[1]}
-        lower_map = {x: y for x, y, _ in lower[1]}
-        common = sorted(set(upper_map) & set(lower_map))
-
-        if not common:
-            raise ValueError("Adjacent curves have no shared x interval.")
-
-        bad = sum(
-            upper_map[x] >= lower_map[x] - 1 for x in common
+        intercepts = ordered_initial_positions(
+            proposed,
+            weights,
         )
-        if bad > 0.03 * len(common):
+        slopes = proposed_slopes
+        sigmas = proposed_sigmas
+
+    return (
+        xs,
+        observations,
+        estimated,
+        slopes,
+        sigmas,
+    )
+
+
+def pixel_for_numerical_x(bounds, x_fit, numerical_x):
+    left, _, right, _ = bounds
+    if x_fit[0] <= 0:
+        raise ValueError("Invalid horizontal calibration.")
+
+    pixel = float(
+        (numerical_x - x_fit[1]) / x_fit[0]
+    )
+    tolerance = max(
+        3.0,
+        0.01 * (right - left),
+    )
+
+    if (
+        pixel < left - tolerance
+        or pixel > right + tolerance
+    ):
+        raise ValueError(
+            f"Speed-length ratio {numerical_x:g} is outside "
+            "the calibrated page domain."
+        )
+
+    return pixel
+
+
+def build_join_guidance(
+    anchors,
+    tags,
+    bounds,
+    x_fit,
+    y_fit,
+    clean,
+    major_spacing,
+    print_sigma,
+):
+    if not anchors:
+        return None
+
+    left, top, right, bottom = bounds
+    height = float(bottom - top)
+    if y_fit[0] >= 0:
+        raise ValueError(
+            "Invalid right-axis calibration direction."
+        )
+
+    by_tag = {
+        anchor.tag: anchor for anchor in anchors
+    }
+    for value in range(1, 8):
+        if str(value) not in by_tag:
             raise ValueError(
-                "Traces cross or merge; curve identities are unreliable."
+                "Paired initialization requires low-speed tags 1–7."
+            )
+
+    pixel_x = pixel_for_numerical_x(
+        bounds,
+        x_fit,
+        JOIN_X,
+    )
+    initial_pixels = []
+    prior_indices = []
+    prior_targets = []
+    prior_sigmas = []
+
+    def pixel_y(cr):
+        return (cr - y_fit[1]) / y_fit[0]
+
+    for index, tag in enumerate(tags):
+        value = float(tag)
+
+        if value.is_integer():
+            anchor = by_tag[str(int(value))]
+            target_pixel = pixel_y(anchor.value)
+            sigma_numeric = math.sqrt(
+                anchor.sigma ** 2
+                + (
+                    JOIN_PIXEL_TOLERANCE
+                    * abs(y_fit[0])
+                ) ** 2
+                + print_sigma ** 2
+            )
+            prior_indices.append(index)
+            prior_targets.append(
+                (target_pixel - top) / height
+            )
+            prior_sigmas.append(max(
+                sigma_numeric
+                / abs(y_fit[0])
+                / height,
+                1e-9,
+            ))
+            initial_pixels.append(target_pixel)
+        else:
+            a = pixel_y(
+                by_tag[
+                    str(int(math.floor(value)))
+                ].value
+            )
+            b = pixel_y(
+                by_tag[
+                    str(int(math.ceil(value)))
+                ].value
+            )
+            initial_pixels.append(
+                0.5 * (a + b)
+            )
+
+    initial_pixels = ordered_initial_positions(
+        np.asarray(initial_pixels, float),
+        np.ones(len(tags)),
+    )
+
+    (
+        local_xs,
+        local_observations,
+        estimates,
+        slopes,
+        sigmas,
+    ) = recover_high_join_strip(
+        clean,
+        bounds,
+        pixel_x,
+        initial_pixels,
+        major_spacing,
+        print_sigma / abs(y_fit[0]),
+    )
+
+    local_indices = np.flatnonzero(
+        np.isfinite(estimates)
+    )
+    local_targets = (
+        estimates[local_indices] - top
+    ) / height
+    local_sigmas = (
+        sigmas[local_indices] / height
+    )
+
+    proposed = initial_pixels.copy()
+    proposed[local_indices] = estimates[local_indices]
+    weights = np.ones(len(tags))
+    weights[local_indices] = 4.0
+    initial_pixels = ordered_initial_positions(
+        proposed,
+        weights,
+    )
+
+    return JoinGuidance(
+        pixel_x=pixel_x,
+        u=(pixel_x - left) / (right - left),
+        initial_pixels=initial_pixels,
+        initial_slopes=slopes,
+        prior_indices=np.asarray(
+            prior_indices,
+            int,
+        ),
+        prior_targets=np.asarray(
+            prior_targets,
+            float,
+        ),
+        prior_sigmas=np.asarray(
+            prior_sigmas,
+            float,
+        ),
+        local_indices=local_indices,
+        local_targets=np.asarray(
+            local_targets,
+            float,
+        ),
+        local_sigmas=np.maximum(
+            np.asarray(local_sigmas, float),
+            1e-9,
+        ),
+        local_xs=local_xs,
+        local_observations=local_observations,
+    )
+
+
+def initial_assignments(
+    xs,
+    candidates,
+    seed_x,
+    seed_ys,
+    bounds,
+    high_speed,
+    guidance=None,
+):
+    count = len(seed_ys)
+    observations = np.full(
+        (count, len(xs)),
+        np.nan,
+    )
+    seed_index = int(
+        np.argmin(np.abs(xs - seed_x))
+    )
+    _, top, _, bottom = bounds
+
+    if guidance is None:
+        observations[:, seed_index] = seed_ys
+        start_positions = seed_ys.astype(float).copy()
+        starting_slopes = np.zeros(count)
+    else:
+        assigned, _, _ = visible_assignment(
+            seed_ys,
+            candidates[seed_index],
+            bounds,
+        )
+        observations[:, seed_index] = assigned
+        start_positions = seed_ys.astype(float).copy()
+        valid = np.isfinite(assigned)
+        start_positions[valid] = assigned[valid]
+        starting_slopes = (
+            guidance.initial_slopes.copy()
+        )
+
+    for direction in (-1, 1):
+        positions = start_positions.copy()
+        velocity = starting_slopes.copy()
+        last_x = np.full(
+            count,
+            float(seed_x),
+        )
+        last_y = start_positions.copy()
+        previous_x = seed_x
+
+        indices = (
+            range(seed_index - 1, -1, -1)
+            if direction < 0
+            else range(seed_index + 1, len(xs))
+        )
+
+        for j in indices:
+            x = int(xs[j])
+            prediction = (
+                positions + velocity * (x - previous_x)
+            )
+
+            if not high_speed:
+                prediction = np.clip(
+                    prediction,
+                    top + 2,
+                    bottom - 2,
+                )
+
+            prediction = np.maximum.accumulate(
+                prediction
+            )
+            assigned, _, _ = visible_assignment(
+                prediction,
+                candidates[j],
+                bounds,
+            )
+            valid = np.isfinite(assigned)
+            observations[valid, j] = assigned[valid]
+
+            for k in np.flatnonzero(valid):
+                distance = x - last_x[k]
+                if distance != 0:
+                    slope = (
+                        assigned[k] - last_y[k]
+                    ) / distance
+                    velocity[k] = (
+                        0.75 * velocity[k]
+                        + 0.25 * np.clip(
+                            slope,
+                            -3.0,
+                            3.0,
+                        )
+                    )
+                last_x[k], last_y[k] = x, assigned[k]
+
+            positions = prediction
+            positions[valid] = assigned[valid]
+            previous_x = x
+
+    if guidance is not None:
+        for local_j, x in enumerate(
+            guidance.local_xs
+        ):
+            matches = np.flatnonzero(xs == x)
+            if not len(matches):
+                continue
+
+            j = int(matches[0])
+            values = guidance.local_observations[
+                :,
+                local_j,
+            ]
+            valid = np.isfinite(values)
+            observations[valid, j] = values[valid]
+
+    return observations
+
+
+def build_ink_evidence(clean, grid_mask, bounds):
+    left, top, right, bottom = bounds
+    local = clean[
+        top:bottom + 1,
+        left:right + 1,
+    ]
+    if not np.any(local):
+        raise ValueError(
+            "No surviving ink inside the plotting frame."
+        )
+
+    background = np.where(
+        local,
+        0,
+        255,
+    ).astype(np.uint8)
+    distance = cv2.distanceTransform(
+        background,
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE,
+    ).astype(float)
+
+    return InkEvidence(
+        distance,
+        grid_mask[
+            top:bottom + 1,
+            left:right + 1,
+        ].copy(),
+        bounds,
+    )
+
+
+def sample_ink(evidence, xs, predicted):
+    left, top, right, bottom = evidence.bounds
+    local_x = np.clip(
+        np.rint(
+            np.asarray(xs) - left
+        ).astype(int),
+        0,
+        evidence.distance.shape[1] - 1,
+    )
+    local_y = predicted - top
+    finite = np.isfinite(local_y)
+    inside = (
+        finite
+        & (predicted >= top + 1)
+        & (predicted <= bottom - 1)
+    )
+
+    safe_y = np.clip(
+        np.where(
+            finite,
+            local_y,
+            0.0,
+        ),
+        0,
+        evidence.distance.shape[0] - 1.000001,
+    )
+    lower = np.floor(safe_y).astype(np.intp)
+    fraction = safe_y - lower
+
+    a = evidence.distance[lower, local_x]
+    b = evidence.distance[lower + 1, local_x]
+    distances = (
+        (1.0 - fraction) * a
+        + fraction * b
+    )
+    derivative = b - a
+
+    nearest_row = np.clip(
+        np.rint(safe_y).astype(np.intp),
+        0,
+        evidence.grid_mask.shape[0] - 1,
+    )
+    masked = evidence.grid_mask[
+        nearest_row,
+        local_x,
+    ]
+    derivative[~inside] = 0.0
+
+    return (
+        distances,
+        derivative,
+        inside,
+        masked,
+    )
+
+
+def assess_image_support(
+    bounds,
+    basis,
+    coefficients,
+    sample_xs,
+    evidence,
+    major_spacing,
+):
+    left, top, right, bottom = bounds
+    dense_xs = np.arange(
+        left,
+        right + 1,
+        dtype=int,
+    )
+    predicted = evaluate_family(
+        bounds,
+        basis,
+        coefficients,
+        dense_xs,
+    )
+    distances, _, inside, masked = sample_ink(
+        evidence,
+        dense_xs,
+        predicted,
+    )
+    near = (
+        inside
+        & (distances <= INK_DISTANCE_TOLERANCE)
+    )
+    obscured = (
+        inside
+        & masked
+        & ~near
+    )
+    evaluable = (
+        inside
+        & (~masked | near)
+    )
+
+    window_width = max(
+        12.0,
+        SUPPORT_WINDOW_MAJOR * major_spacing,
+    )
+    window_ids = np.floor(
+        (dense_xs - left) / window_width
+    ).astype(int)
+    windows = int(window_ids.max()) + 1
+
+    states = np.full(
+        (len(coefficients), windows),
+        -1,
+        np.int8,
+    )
+    maximum_gap = max(
+        1,
+        int(math.ceil(
+            SUPPORT_MAX_GAP_MAJOR
+            * major_spacing
+            / window_width
+        )),
+    )
+    right_edges = np.full(
+        len(coefficients),
+        float(left),
+    )
+    fractions = np.zeros(
+        len(coefficients),
+        float,
+    )
+    valid = np.zeros(
+        len(coefficients),
+        bool,
+    )
+
+    for k in range(len(coefficients)):
+        for window in range(windows):
+            columns = window_ids == window
+            n_inside = int(np.count_nonzero(
+                inside[k] & columns
+            ))
+
+            if n_inside == 0:
+                states[k, window] = -2
+                continue
+
+            n_evaluable = int(np.count_nonzero(
+                evaluable[k] & columns
+            ))
+            required = max(
+                4,
+                int(math.ceil(
+                    SUPPORT_MIN_EVALUABLE_FRACTION
+                    * n_inside
+                )),
+            )
+            if n_evaluable < required:
+                continue
+
+            n_supported = int(np.count_nonzero(
+                near[k]
+                & evaluable[k]
+                & columns
+            ))
+            fraction = n_supported / n_evaluable
+            states[k, window] = (
+                1
+                if fraction >= SUPPORT_MIN_FRACTION
+                else 0
+            )
+
+        reliable = np.flatnonzero(
+            states[k] == 1
+        )
+        if not len(reliable):
+            continue
+
+        last_reliable = int(reliable[0])
+        for window in reliable[1:]:
+            if (
+                int(window) - last_reliable - 1
+                > maximum_gap
+            ):
+                break
+            last_reliable = int(window)
+
+        retained_columns = (
+            window_ids <= last_reliable
+        )
+        supported_points = np.flatnonzero(
+            near[k] & retained_columns
+        )
+        if (
+            len(supported_points)
+            < MIN_HIGH_SUPPORT_COLUMNS
+        ):
+            continue
+
+        right_edges[k] = float(
+            dense_xs[supported_points[-1]]
+        )
+        domain = (
+            dense_xs <= right_edges[k]
+        )
+        known = (
+            evaluable[k] & domain
+        )
+        denominator = int(
+            np.count_nonzero(known)
+        )
+        fractions[k] = (
+            np.count_nonzero(near[k] & known)
+            / denominator
+            if denominator else 0.0
+        )
+        valid[k] = (
+            denominator >= MIN_HIGH_SUPPORT_COLUMNS
+            and fractions[k] >= SUPPORT_MIN_FRACTION
+        )
+
+    sampled_mask = (
+        sample_xs[None, :]
+        <= right_edges[:, None]
+    )
+
+    return ImageSupport(
+        dense_xs,
+        near,
+        obscured,
+        inside,
+        right_edges,
+        sampled_mask,
+        states,
+        fractions,
+        valid,
+    )
+
+
+def spline_basis(basis_count):
+    interior_count = (
+        basis_count - SPLINE_DEGREE - 1
+    )
+    interior = np.linspace(
+        0.0,
+        1.0,
+        interior_count + 2,
+    )[1:-1]
+    knots = np.concatenate((
+        np.zeros(SPLINE_DEGREE + 1),
+        interior,
+        np.ones(SPLINE_DEGREE + 1),
+    ))
+
+    return BSpline(
+        knots,
+        np.eye(basis_count),
+        SPLINE_DEGREE,
+        extrapolate=False,
+    )
+
+
+def coefficient_constraints(
+    count,
+    basis_count,
+    height,
+    basis,
+    guidance,
+):
+    matrix = np.zeros((
+        (count - 1) * basis_count,
+        count * basis_count,
+    ))
+
+    for k in range(count - 1):
+        for j in range(basis_count):
+            row = k * basis_count + j
+            matrix[
+                row,
+                k * basis_count + j,
+            ] = -1.0
+            matrix[
+                row,
+                (k + 1) * basis_count + j,
+            ] = 1.0
+
+    constraints = [
+        LinearConstraint(
+            matrix,
+            SPLINE_MIN_SEPARATION / height,
+            np.inf,
+        )
+    ]
+
+    if guidance is not None:
+        join_design = np.asarray(
+            basis(
+                guidance.u,
+                extrapolate=True,
+            ),
+            float,
+        )
+        join_matrix = np.zeros((
+            count - 1,
+            count * basis_count,
+        ))
+
+        for k in range(count - 1):
+            join_matrix[
+                k,
+                k * basis_count:(k + 1) * basis_count,
+            ] = -join_design
+            join_matrix[
+                k,
+                (k + 1) * basis_count:(k + 2) * basis_count,
+            ] = join_design
+
+        constraints.append(LinearConstraint(
+            join_matrix,
+            SPLINE_MIN_SEPARATION / height,
+            np.inf,
+        ))
+
+    return constraints
+
+
+def robust_penalty(residual):
+    root = np.sqrt(
+        1.0 + residual * residual
+    )
+    return (
+        2.0 * (root - 1.0),
+        2.0 * residual / root,
+    )
+
+
+def optimize_coefficients(
+    coefficients,
+    basis,
+    xs,
+    observations,
+    included,
+    seed_x,
+    seed_ys,
+    bounds,
+    shape_weight,
+    high_speed,
+    guidance,
+    evidence,
+    ink_weight,
+    support=None,
+    snapshot=None,
+):
+    left, top, right, bottom = bounds
+    height = float(bottom - top)
+    count, basis_count = coefficients.shape
+
+    design = np.asarray(
+        basis((xs - left) / (right - left)),
+        float,
+    )
+    seed_design = np.asarray(
+        basis((seed_x - left) / (right - left)),
+        float,
+    )
+    regularization_x = np.linspace(
+        0.0,
+        1.0,
+        100,
+    )
+    slope_design = np.asarray(
+        basis.derivative(1)(regularization_x),
+        float,
+    )
+    curvature_design = np.asarray(
+        basis.derivative(2)(regularization_x),
+        float,
+    )
+
+    valid = (
+        np.isfinite(observations)
+        & included[None, :]
+    )
+    if support is not None:
+        valid &= support.sampled_mask
+
+    curves, columns = np.nonzero(valid)
+    targets = (
+        observations[curves, columns] - top
+    ) / height
+
+    if len(targets) < count * 3:
+        raise ValueError(
+            "Too few assigned image observations."
+        )
+
+    rows = design[columns]
+    scale = height / SPLINE_ROBUST_SCALE
+    seed_targets = (
+        seed_ys - top
+    ) / height
+
+    if high_speed:
+        counts = np.bincount(
+            curves,
+            minlength=count,
+        )
+        if np.any(counts == 0):
+            raise ValueError(
+                "A high-speed curve has no observations."
+            )
+        data_weights = (
+            1.0 / (count * counts[curves])
+        )
+    else:
+        data_weights = np.full(
+            len(targets),
+            1.0 / len(targets),
+        )
+
+    constraints = coefficient_constraints(
+        count,
+        basis_count,
+        height,
+        basis,
+        guidance,
+    )
+    join_design = (
+        np.asarray(
+            basis(
+                guidance.u,
+                extrapolate=True,
+            ),
+            float,
+        )
+        if guidance is not None else None
+    )
+
+    ink_weights = None
+    if high_speed and ink_weight > 0:
+        starting_prediction = (
+            top
+            + height * (coefficients @ design.T)
+        )
+        _, _, _, starting_mask = sample_ink(
+            evidence,
+            xs,
+            starting_prediction,
+        )
+        ink_weights = np.where(
+            starting_mask,
+            INK_MASKED_WEIGHT,
+            1.0,
+        )
+        ink_weights *= included[None, :]
+
+        if support is not None:
+            ink_weights *= support.sampled_mask
+
+        normalizers = np.maximum(
+            np.sum(
+                ink_weights,
+                axis=1,
+                keepdims=True,
+            ),
+            1.0,
+        )
+        ink_weights = (
+            ink_weights / normalizers / count
+        )
+
+    def objective(flat):
+        c = flat.reshape(
+            count,
+            basis_count,
+        )
+        prediction = np.sum(
+            c[curves] * rows,
+            axis=1,
+        )
+        residual = scale * (
+            prediction - targets
+        )
+        loss, derivative = robust_penalty(
+            residual
+        )
+
+        value = float(np.sum(
+            data_weights * loss
+        ))
+        gradient = np.zeros_like(c)
+        factors = (
+            data_weights * derivative * scale
+        )
+        np.add.at(
+            gradient,
+            curves,
+            factors[:, None] * rows,
+        )
+
+        bending = (
+            c @ curvature_design.T
+        )
+        value += (
+            SPLINE_SMOOTHNESS
+            * float(np.mean(bending ** 2))
+        )
+        gradient += (
+            2.0 * SPLINE_SMOOTHNESS / bending.size
+            * (bending @ curvature_design)
+        )
+
+        if shape_weight > 0:
+            differences = (
+                np.diff(c, axis=0) @ slope_design.T
+            )
+            value += (
+                shape_weight
+                * float(np.mean(differences ** 2))
+            )
+            changes = (
+                2.0 * shape_weight / differences.size
+                * (differences @ slope_design)
+            )
+            gradient[:-1] -= changes
+            gradient[1:] += changes
+
+        if guidance is None:
+            seed_residual = scale * (
+                c @ seed_design - seed_targets
+            )
+            seed_weight = 0.05
+            value += (
+                seed_weight
+                * float(np.mean(seed_residual ** 2))
+            )
+            gradient += (
+                2.0 * seed_weight / count
+                * seed_residual[:, None]
+                * scale * seed_design[None, :]
+            )
+
+        if (
+            guidance is not None
+            and join_design is not None
+        ):
+            indices = guidance.prior_indices
+            residual_prior = (
+                c[indices] @ join_design
+                - guidance.prior_targets
+            ) / guidance.prior_sigmas
+
+            prior_loss, prior_derivative = robust_penalty(
+                residual_prior
+            )
+            value += (
+                LOW_JOIN_PRIOR_WEIGHT
+                * float(np.mean(prior_loss))
+            )
+            prior_factors = (
+                LOW_JOIN_PRIOR_WEIGHT / len(indices)
+                * prior_derivative
+                / guidance.prior_sigmas
+            )
+            np.add.at(
+                gradient,
+                indices,
+                prior_factors[:, None]
+                * join_design[None, :],
+            )
+
+            local_indices = (
+                guidance.local_indices
+            )
+            if len(local_indices):
+                residual_local = (
+                    c[local_indices] @ join_design
+                    - guidance.local_targets
+                ) / guidance.local_sigmas
+
+                local_loss, local_derivative = robust_penalty(
+                    residual_local
+                )
+                value += (
+                    HIGH_JOIN_IMAGE_WEIGHT
+                    * float(np.mean(local_loss))
+                )
+                local_factors = (
+                    HIGH_JOIN_IMAGE_WEIGHT / len(local_indices)
+                    * local_derivative
+                    / guidance.local_sigmas
+                )
+                np.add.at(
+                    gradient,
+                    local_indices,
+                    local_factors[:, None]
+                    * join_design[None, :],
+                )
+
+        if ink_weights is not None:
+            all_prediction = (
+                top + height * (c @ design.T)
+            )
+            (
+                distance,
+                ink_derivative,
+                inside,
+                _,
+            ) = sample_ink(
+                evidence,
+                xs,
+                all_prediction,
+            )
+            residual_ink = (
+                distance / INK_DISTANCE_TOLERANCE
+            )
+            ink_loss, ink_loss_derivative = robust_penalty(
+                residual_ink
+            )
+            weights = (
+                ink_weights * inside
+            )
+
+            value += (
+                ink_weight
+                * float(np.sum(weights * ink_loss))
+            )
+            ordinate_gradient = (
+                ink_weight
+                * weights
+                * ink_loss_derivative
+                * ink_derivative
+                / INK_DISTANCE_TOLERANCE
+                * height
+            )
+            gradient += (
+                ordinate_gradient @ design
+            )
+
+        return value, gradient.ravel()
+
+    lower = (
+        -np.inf if high_speed
+        else 2.0 / height
+    )
+    upper = (
+        np.inf if high_speed
+        else 1.0 - 2.0 / height
+    )
+
+    result = minimize(
+        objective,
+        coefficients.ravel(),
+        method="SLSQP",
+        jac=True,
+        bounds=Bounds(
+            np.full(
+                count * basis_count,
+                lower,
+            ),
+            np.full(
+                count * basis_count,
+                upper,
+            ),
+        ),
+        constraints=constraints,
+        options={
+            "maxiter": SPLINE_OPTIMIZER_ITERATIONS,
+            "ftol": 1e-7,
+            "disp": False,
+        },
+    )
+
+    fitted = result.x.reshape(
+        count,
+        basis_count,
+    )
+
+    if (
+        snapshot is not None
+        and np.all(np.isfinite(fitted))
+    ):
+        snapshot(
+            fitted,
+            (
+                "Optimizer candidate - not yet validated"
+                if result.success
+                else (
+                    "Rejected optimizer candidate: "
+                    f"{result.message}"
+                )
+            ),
+        )
+
+    if not result.success:
+        raise ValueError(
+            f"Spline optimization failed: {result.message}"
+        )
+    if not np.all(np.isfinite(fitted)):
+        raise ValueError(
+            "Nonfinite spline coefficients."
+        )
+    if np.any(
+        np.diff(fitted, axis=0)
+        < SPLINE_MIN_SEPARATION / height - 1e-7
+    ):
+        raise ValueError(
+            "Spline coefficient ordering failed."
+        )
+
+    return fitted
+
+
+def evaluate_family(
+    bounds,
+    basis,
+    coefficients,
+    xs,
+    extrapolate=False,
+):
+    left, top, right, bottom = bounds
+    design = np.asarray(
+        basis(
+            (
+                np.asarray(xs) - left
+            ) / (right - left),
+            extrapolate=extrapolate,
+        ),
+        float,
+    )
+    return (
+        top
+        + (bottom - top)
+        * (coefficients @ design.T)
+    )
+
+
+def assign_to_models(
+    predicted,
+    candidates,
+    bounds,
+    included=None,
+    support=None,
+    high_speed=False,
+):
+    assigned = np.full_like(
+        predicted,
+        np.nan,
+    )
+    total_cost = 0.0
+    evaluated = 0
+
+    for j in range(predicted.shape[1]):
+        if included is not None and not included[j]:
+            continue
+
+        allowed = (
+            support.sampled_mask[:, j] & support.valid
+            if support is not None else None
+        )
+        assigned[:, j], cost, active = visible_assignment(
+            predicted[:, j],
+            candidates[j],
+            bounds,
+            allowed=allowed,
+            reject_ambiguous=high_speed,
+        )
+        total_cost += cost
+        evaluated += active
+
+    return (
+        assigned,
+        total_cost / max(1, evaluated),
+    )
+
+
+def check_support(
+    observations,
+    included,
+    high_speed,
+    support,
+    tags,
+):
+    minimum = (
+        MIN_HIGH_SUPPORT_COLUMNS
+        if high_speed
+        else MIN_CURVE_SUPPORT_COLUMNS
+    )
+
+    for k, tag in enumerate(tags):
+        if (
+            support is not None
+            and not support.valid[k]
+        ):
+            raise ValueError(
+                f"Hull {tag}: insufficient direct cleaned-ink overlap."
+            )
+
+        valid = (
+            np.isfinite(observations[k])
+            & included
+        )
+        if support is not None:
+            valid &= support.sampled_mask[k]
+
+        if np.count_nonzero(valid) < minimum:
+            raise ValueError(
+                f"Hull {tag}: too few distinct assigned observations."
             )
 
 
-# ----------------------------------------------------------------------
-# Diagnostics and main program
-# ----------------------------------------------------------------------
+def fit_one_complexity(
+    basis_count,
+    xs,
+    candidates,
+    initial,
+    seed_x,
+    seed_ys,
+    bounds,
+    included,
+    shape_weight,
+    high_speed,
+    guidance,
+    evidence,
+    major_spacing,
+    ink_weight,
+    tags,
+    diagnostic_callback=None,
+):
+    left, top, right, bottom = bounds
+    height = float(bottom - top)
+    basis = spline_basis(basis_count)
+    design = np.asarray(
+        basis((xs - left) / (right - left)),
+        float,
+    )
+    coefficients = np.repeat(
+        (
+            (seed_ys - top) / height
+        )[:, None],
+        basis_count,
+        axis=1,
+    )
+    observations = initial.copy()
+    observations[:, ~included] = np.nan
+    support = None
 
-def tint_mask(image, mask, color, opacity=0.65):
-    result = image.copy()
-    if np.any(mask):
-        result[mask] = (
-            (1 - opacity) * result[mask].astype(float)
-            + opacity * np.array(color, dtype=float)
-        ).astype(np.uint8)
+    for iteration in range(
+        SPLINE_ASSIGNMENT_ITERATIONS
+    ):
+        previous = coefficients.copy()
+
+        def snapshot(candidate, status):
+            if diagnostic_callback is not None:
+                candidate_support = (
+                    assess_image_support(
+                        bounds,
+                        basis,
+                        candidate,
+                        xs,
+                        evidence,
+                        major_spacing,
+                    )
+                    if high_speed else None
+                )
+                diagnostic_callback(
+                    xs,
+                    observations,
+                    basis,
+                    candidate,
+                    tags,
+                    candidate_support,
+                    f"{basis_count} coefficients; {status}",
+                )
+
+        coefficients = optimize_coefficients(
+            coefficients,
+            basis,
+            xs,
+            observations,
+            included,
+            seed_x,
+            seed_ys,
+            bounds,
+            shape_weight,
+            high_speed,
+            guidance,
+            evidence,
+            ink_weight,
+            support,
+            snapshot,
+        )
+
+        support = (
+            assess_image_support(
+                bounds,
+                basis,
+                coefficients,
+                xs,
+                evidence,
+                major_spacing,
+            )
+            if high_speed else None
+        )
+        predicted = (
+            top
+            + height * (coefficients @ design.T)
+        )
+        observations, _ = assign_to_models(
+            predicted,
+            candidates,
+            bounds,
+            included,
+            support,
+            high_speed,
+        )
+
+        if diagnostic_callback is not None:
+            diagnostic_callback(
+                xs,
+                observations,
+                basis,
+                coefficients,
+                tags,
+                support,
+                "Candidate assessed against cleaned ink",
+            )
+
+        check_support(
+            observations,
+            included,
+            high_speed,
+            support,
+            tags,
+        )
+
+        movement = height * float(np.max(np.abs(
+            (coefficients - previous) @ design.T
+        )))
+        if iteration >= 1 and movement < 0.15:
+            break
+
+    return basis, coefficients, support
+
+
+def validate_family(
+    bounds,
+    basis,
+    coefficients,
+    guidance=None,
+):
+    left, top, right, bottom = bounds
+    height = bottom - top
+    predicted = evaluate_family(
+        bounds,
+        basis,
+        coefficients,
+        np.arange(
+            left,
+            right + 1,
+            dtype=int,
+        ),
+    )
+
+    if not np.all(np.isfinite(predicted)):
+        raise ValueError(
+            "Nonfinite fitted coordinates."
+        )
+    if np.any(
+        np.diff(predicted, axis=0)
+        < SPLINE_MIN_SEPARATION - 1e-3
+    ):
+        raise ValueError(
+            "Evaluated fitted curves cross."
+        )
+
+    if guidance is not None:
+        join_design = np.asarray(
+            basis(
+                guidance.u,
+                extrapolate=True,
+            ),
+            float,
+        )
+        join_values = (
+            coefficients @ join_design
+        )
+
+        if np.any(
+            np.diff(join_values)
+            < SPLINE_MIN_SEPARATION / height - 1e-6
+        ):
+            raise ValueError(
+                "Curve ordering failed at x=1."
+            )
+
+
+def contiguous_groups(indices):
+    if not len(indices):
+        return []
+    return np.split(
+        indices,
+        np.flatnonzero(np.diff(indices) > 1) + 1,
+    )
+
+
+def export_fitted_paths(
+    clean,
+    bounds,
+    basis,
+    coefficients,
+    high_speed,
+    support,
+):
+    left, top, right, bottom = bounds
+    xs = np.arange(
+        left,
+        right + 1,
+        dtype=int,
+    )
+    predicted = evaluate_family(
+        bounds,
+        basis,
+        coefficients,
+        xs,
+    )
+    assignments = np.full(
+        predicted.shape,
+        np.nan,
+    )
+
+    for j, x in enumerate(xs):
+        if x < left + 2 or x > right - 2:
+            continue
+
+        allowed = (
+            (x <= support.right_edges) & support.valid
+            if support is not None else None
+        )
+        assignments[:, j], _, _ = visible_assignment(
+            predicted[:, j],
+            column_candidates(
+                clean,
+                bounds,
+                int(x),
+            ),
+            bounds,
+            tolerance=OBSERVED_TOLERANCE,
+            allowed=allowed,
+            reject_ambiguous=high_speed,
+        )
+
+    minimum = (
+        MIN_HIGH_SUPPORT_COLUMNS
+        if high_speed
+        else MIN_CURVE_SUPPORT_COLUMNS
+    )
+    paths = []
+
+    for k in range(len(coefficients)):
+        assigned_support = np.isfinite(
+            assignments[k]
+        )
+        if (
+            np.count_nonzero(assigned_support)
+            < minimum
+        ):
+            raise ValueError(
+                f"Hull index {k + 1}: insufficient final assigned support."
+            )
+
+        visible = (
+            (predicted[k] >= top)
+            & (predicted[k] <= bottom)
+        )
+        if support is not None:
+            visible &= (
+                xs <= support.right_edges[k]
+            )
+
+        path = []
+        for group in contiguous_groups(
+            np.flatnonzero(visible)
+        ):
+            supported = group[
+                assigned_support[group]
+            ]
+            if len(supported) < minimum:
+                continue
+
+            first_support = int(supported[0])
+            last_support = int(supported[-1])
+            first_export = (
+                0 if int(group[0]) == 0
+                else first_support
+            )
+
+            for j in range(
+                first_export,
+                last_support + 1,
+            ):
+                observed = bool(
+                    assigned_support[j]
+                )
+                kind = (
+                    "image_supported" if observed
+                    else "left_projected"
+                    if j < first_support
+                    else "interpolated"
+                )
+                path.append((
+                    float(xs[j]),
+                    float(predicted[k, j]),
+                    observed,
+                    kind,
+                ))
+
+        if not path:
+            raise ValueError(
+                f"Hull index {k + 1}: no supported visible component."
+            )
+        paths.append(path)
+
+    return paths
+
+
+def fit_curve_family(
+    clean,
+    grid_mask,
+    bounds,
+    requested_count,
+    shape_weight,
+    high_speed,
+    x_fit,
+    y_fit,
+    major_spacing,
+    ink_weight,
+    print_sigma,
+    anchors=None,
+    diagnostic_callback=None,
+):
+    left, top, right, bottom = bounds
+    evidence = build_ink_evidence(
+        clean,
+        grid_mask,
+        bounds,
+    )
+
+    if high_speed and anchors:
+        tags = tags_for_count(12)
+        guidance = build_join_guidance(
+            anchors,
+            tags,
+            bounds,
+            x_fit,
+            y_fit,
+            clean,
+            major_spacing,
+            print_sigma,
+        )
+        if guidance is None:
+            raise ValueError(
+                "Missing paired join guidance."
+            )
+
+        seed_x = int(np.clip(
+            round(guidance.pixel_x),
+            left + 2,
+            right - 2,
+        ))
+        seed_ys = ordered_initial_positions(
+            guidance.initial_pixels
+            + guidance.initial_slopes
+            * (
+                seed_x - guidance.pixel_x
+            ),
+            np.ones(len(tags)),
+        )
+    else:
+        guidance = None
+        seeds = choose_seeds(
+            clean,
+            bounds,
+            requested_count,
+            high_speed,
+        )
+        if seeds is None:
+            raise ValueError(
+                "No complete seed column. Inspect clean."
+            )
+        seed_x, seed_ys = seeds
+        tags = tags_for_count(len(seed_ys))
+
+    step = max(
+        1,
+        int(math.ceil(
+            (right - left + 1)
+            / SPLINE_MAX_SAMPLE_COLUMNS
+        )),
+    )
+    parts = [
+        np.arange(
+            left + 2,
+            right - 1,
+            step,
+            dtype=int,
+        ),
+        np.array(
+            [seed_x],
+            dtype=int,
+        ),
+    ]
+    if guidance is not None:
+        parts.append(
+            guidance.local_xs
+        )
+
+    xs = np.unique(
+        np.concatenate(parts)
+    )
+    candidates = [
+        column_candidates(
+            clean,
+            bounds,
+            int(x),
+        )
+        for x in xs
+    ]
+    initial = initial_assignments(
+        xs,
+        candidates,
+        seed_x,
+        seed_ys,
+        bounds,
+        high_speed,
+        guidance,
+    )
+
+    if diagnostic_callback is not None:
+        initial_basis = spline_basis(
+            SPLINE_BASIS_COUNTS[0]
+        )
+        initial_coefficients = np.repeat(
+            (
+                (seed_ys - top) / (bottom - top)
+            )[:, None],
+            SPLINE_BASIS_COUNTS[0],
+            axis=1,
+        )
+        initial_support = (
+            assess_image_support(
+                bounds,
+                initial_basis,
+                initial_coefficients,
+                xs,
+                evidence,
+                major_spacing,
+            )
+            if high_speed else None
+        )
+        diagnostic_callback(
+            xs,
+            initial,
+            initial_basis,
+            initial_coefficients,
+            tags,
+            initial_support,
+            "INITIALIZATION ONLY - no optimization performed",
+        )
+
+    validation = (
+        (np.arange(len(xs)) // 8) % 5 == 2
+    )
+    validation[xs == seed_x] = False
+    if guidance is not None:
+        validation[
+            np.isin(
+                xs,
+                guidance.local_xs,
+            )
+        ] = False
+
+    training = ~validation
+    choices = []
+    last_error = ""
+
+    for basis_count in SPLINE_BASIS_COUNTS:
+        try:
+            (
+                basis,
+                coefficients,
+                support,
+            ) = fit_one_complexity(
+                basis_count,
+                xs,
+                candidates,
+                initial,
+                seed_x,
+                seed_ys,
+                bounds,
+                training,
+                shape_weight,
+                high_speed,
+                guidance,
+                evidence,
+                major_spacing,
+                ink_weight,
+                tags,
+                diagnostic_callback,
+            )
+            predicted = evaluate_family(
+                bounds,
+                basis,
+                coefficients,
+                xs,
+            )
+            assigned, score = assign_to_models(
+                predicted,
+                candidates,
+                bounds,
+                validation,
+                support,
+                high_speed,
+            )
+
+            possible = (
+                len(tags)
+                * max(
+                    1,
+                    int(np.count_nonzero(validation)),
+                )
+                if support is None
+                else max(
+                    1,
+                    int(np.count_nonzero(
+                        support.sampled_mask
+                        & validation[None, :]
+                    )),
+                )
+            )
+            observed_fraction = (
+                np.count_nonzero(
+                    np.isfinite(assigned)
+                ) / possible
+            )
+            score += (
+                0.25 * (1.0 - observed_fraction)
+            )
+
+            if support is not None:
+                score += float(np.mean(
+                    1.0 - support.retained_fraction
+                ))
+
+            choices.append((
+                score,
+                basis_count,
+                basis,
+                coefficients,
+                support,
+            ))
+        except ValueError as error:
+            last_error = str(error)
+
+    if not choices:
+        raise ValueError(
+            "No supported spline fit. " + last_error
+        )
+
+    best_score = min(
+        choice[0] for choice in choices
+    )
+    eligible = [
+        choice for choice in choices
+        if choice[0]
+        <= best_score + max(0.005, 0.02 * best_score)
+    ]
+    (
+        score,
+        basis_count,
+        basis,
+        coefficients,
+        support,
+    ) = min(
+        eligible,
+        key=lambda choice: choice[1],
+    )
+
+    all_columns = np.ones(
+        len(xs),
+        bool,
+    )
+    design = np.asarray(
+        basis((xs - left) / (right - left)),
+        float,
+    )
+
+    for iteration in range(
+        SPLINE_ASSIGNMENT_ITERATIONS
+    ):
+        predicted = (
+            top
+            + (bottom - top)
+            * (coefficients @ design.T)
+        )
+        observations, _ = assign_to_models(
+            predicted,
+            candidates,
+            bounds,
+            None,
+            support,
+            high_speed,
+        )
+
+        if diagnostic_callback is not None:
+            diagnostic_callback(
+                xs,
+                observations,
+                basis,
+                coefficients,
+                tags,
+                support,
+                "Final-stage candidate - not yet validated",
+            )
+
+        check_support(
+            observations,
+            all_columns,
+            high_speed,
+            support,
+            tags,
+        )
+        previous = coefficients.copy()
+
+        def snapshot(candidate, status):
+            if diagnostic_callback is not None:
+                candidate_support = (
+                    assess_image_support(
+                        bounds,
+                        basis,
+                        candidate,
+                        xs,
+                        evidence,
+                        major_spacing,
+                    )
+                    if high_speed else None
+                )
+                diagnostic_callback(
+                    xs,
+                    observations,
+                    basis,
+                    candidate,
+                    tags,
+                    candidate_support,
+                    status,
+                )
+
+        coefficients = optimize_coefficients(
+            coefficients,
+            basis,
+            xs,
+            observations,
+            all_columns,
+            seed_x,
+            seed_ys,
+            bounds,
+            shape_weight,
+            high_speed,
+            guidance,
+            evidence,
+            ink_weight,
+            support,
+            snapshot,
+        )
+        support = (
+            assess_image_support(
+                bounds,
+                basis,
+                coefficients,
+                xs,
+                evidence,
+                major_spacing,
+            )
+            if high_speed else None
+        )
+
+        movement = (
+            (bottom - top)
+            * float(np.max(np.abs(
+                (coefficients - previous) @ design.T
+            )))
+        )
+        if iteration >= 1 and movement < 0.15:
+            break
+
+    predicted = evaluate_family(
+        bounds,
+        basis,
+        coefficients,
+        xs,
+    )
+    assigned, _ = assign_to_models(
+        predicted,
+        candidates,
+        bounds,
+        None,
+        support,
+        high_speed,
+    )
+
+    if diagnostic_callback is not None:
+        diagnostic_callback(
+            xs,
+            assigned,
+            basis,
+            coefficients,
+            tags,
+            support,
+            "Final candidate - awaiting export validation",
+        )
+
+    validate_family(
+        bounds,
+        basis,
+        coefficients,
+        guidance,
+    )
+    check_support(
+        assigned,
+        all_columns,
+        high_speed,
+        support,
+        tags,
+    )
+    paths = export_fitted_paths(
+        clean,
+        bounds,
+        basis,
+        coefficients,
+        high_speed,
+        support,
+    )
+
+    return CurveModel(
+        basis,
+        coefficients,
+        tags,
+        paths,
+        seed_x,
+        seed_ys,
+        basis_count,
+        score,
+        xs,
+        assigned,
+        support,
+        guidance,
+    )
+
+
+def label_preview(
+    base,
+    bounds,
+    bottom,
+    right,
+    title,
+    top_band,
+):
+    image = base.copy()
+    draw_frame(image, bounds)
+
+    for box, color in (
+        (title, (180, 0, 180)),
+        (top_band, (0, 180, 0)),
+    ):
+        if box:
+            x0, y0, x1, y1 = box
+            cv2.rectangle(
+                image,
+                (x0, y0),
+                (x1 - 1, y1 - 1),
+                color,
+                2,
+            )
+
+    for labels, color in (
+        (bottom, (255, 120, 0)),
+        (right, (0, 160, 255)),
+    ):
+        for word in labels:
+            cv2.rectangle(
+                image,
+                (word.left, word.top),
+                (word.right, word.bottom),
+                color,
+                2,
+            )
+            cv2.circle(
+                image,
+                (round(word.cx), round(word.cy)),
+                3,
+                color,
+                -1,
+            )
+
+    return image
+
+
+def curve_colors(tags):
+    """
+    Display-only change.
+
+    Assign colors by numeric tag, progressing from 1 upward rather
+    than from the first/top curve downward.
+
+    A tag receives the same color on both pages, regardless of how
+    many curves are present. Current tags are used unchanged.
+    """
+    tags = list(tags)
+    if not tags:
+        return []
+
+    hsv = np.zeros(
+        (len(tags), 1, 3),
+        np.uint8,
+    )
+
+    for index, tag in enumerate(tags):
+        value = float(tag)
+        if (
+            not math.isfinite(value)
+            or not 1.0 <= value <= 7.0
+        ):
+            raise ValueError(
+                f"Invalid curve tag for display palette: {tag!r}"
+            )
+
+        hsv[index, 0, 0] = round(
+            (value - 1.0) * 180.0 / 7.0
+        )
+        hsv[index, 0, 1] = 220
+        hsv[index, 0, 2] = 210
+
+    bgr = cv2.cvtColor(
+        hsv,
+        cv2.COLOR_HSV2BGR,
+    )
+
+    return [
+        tuple(int(value) for value in color)
+        for color in bgr[:, 0]
+    ]
+
+
+def diagnostic_banner(image, status):
+    header = 62
+    result = np.full(
+        (
+            image.shape[0] + header,
+            image.shape[1],
+            3,
+        ),
+        255,
+        np.uint8,
+    )
+    result[header:] = image
+
+    max_characters = max(
+        30,
+        image.shape[1] // 8,
+    )
+    lines, current = [], ""
+
+    for word in status.split():
+        if (
+            current
+            and len(current) + len(word) + 1
+            > max_characters
+        ):
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+
+    if current:
+        lines.append(current)
+
+    for index, line in enumerate(lines[:3]):
+        cv2.putText(
+            result,
+            line,
+            (10, 18 + 18 * index),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 160),
+            1,
+            cv2.LINE_AA,
+        )
+
     return result
 
 
+def draw_fitted_path(image, path, color):
+    for previous, current in zip(
+        path,
+        path[1:],
+    ):
+        x0, y0, observed0, _ = previous
+        x1, y1, observed1, _ = current
+
+        if x1 - x0 > 1.5:
+            continue
+
+        supported = observed0 and observed1
+        cv2.line(
+            image,
+            (round(x0), round(y0)),
+            (round(x1), round(y1)),
+            color if supported else (130, 130, 130),
+            2 if supported else 1,
+        )
+
+    for x, y, observed, _ in path:
+        if not observed and round(x) % 8 == 0:
+            cv2.circle(
+                image,
+                (round(x), round(y)),
+                1,
+                (0, 140, 255),
+                -1,
+            )
+
+
+def candidate_preview(
+    base,
+    bounds,
+    xs,
+    assigned,
+    basis,
+    coefficients,
+    tags,
+    support,
+    mode,
+):
+    image = base.copy()
+    left, top, right, bottom = bounds
+
+    # Display-only: use actual tags instead of curve count.
+    colors = curve_colors(tags)
+
+    dense_x = np.arange(
+        left,
+        right + 1,
+        dtype=int,
+    )
+    predicted = evaluate_family(
+        bounds,
+        basis,
+        coefficients,
+        dense_x,
+    )
+
+    for k, color in enumerate(colors):
+        visible = (
+            np.isfinite(predicted[k])
+            & (predicted[k] >= top)
+            & (predicted[k] <= bottom)
+        )
+
+        for group in contiguous_groups(
+            np.flatnonzero(visible)
+        ):
+            if len(group) > 1:
+                points = np.rint(
+                    np.column_stack((
+                        dense_x[group],
+                        predicted[k, group],
+                    ))
+                ).astype(np.int32)
+                cv2.polylines(
+                    image,
+                    [points],
+                    False,
+                    (170, 170, 170),
+                    1,
+                )
+
+        retained = visible.copy()
+        if support is not None:
+            retained &= (
+                dense_x <= support.right_edges[k]
+            ) & support.valid[k]
+
+        if mode != "support":
+            for group in contiguous_groups(
+                np.flatnonzero(retained)
+            ):
+                if len(group) > 1:
+                    points = np.rint(
+                        np.column_stack((
+                            dense_x[group],
+                            predicted[k, group],
+                        ))
+                    ).astype(np.int32)
+                    cv2.polylines(
+                        image,
+                        [points],
+                        False,
+                        color,
+                        1 if mode == "assignments" else 2,
+                    )
+
+        if mode == "support" and support is not None:
+            for j in np.flatnonzero(visible)[::4]:
+                if support.near_ink[k, j]:
+                    point_color = (0, 180, 0)
+                elif support.obscured[k, j]:
+                    point_color = (0, 150, 255)
+                else:
+                    point_color = (0, 0, 230)
+
+                cv2.circle(
+                    image,
+                    (
+                        int(dense_x[j]),
+                        round(float(predicted[k, j])),
+                    ),
+                    2,
+                    point_color,
+                    -1,
+                )
+
+        left_y = float(predicted[k, 0])
+        if (
+            math.isfinite(left_y)
+            and top <= left_y <= bottom
+        ):
+            cv2.circle(
+                image,
+                (left, round(left_y)),
+                4,
+                color,
+                -1,
+            )
+            cv2.putText(
+                image,
+                tags[k],
+                (left + 7, round(left_y) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        if support is not None and support.valid[k]:
+            edge = float(
+                support.right_edges[k]
+            )
+            y = float(
+                evaluate_family(
+                    bounds,
+                    basis,
+                    coefficients,
+                    np.array([edge]),
+                )[k, 0]
+            )
+            if (
+                math.isfinite(y)
+                and top <= y <= bottom
+            ):
+                cv2.line(
+                    image,
+                    (round(edge), round(y) - 6),
+                    (round(edge), round(y) + 6),
+                    color,
+                    2,
+                )
+
+    if mode == "assignments":
+        for k, color in enumerate(colors):
+            for j in np.flatnonzero(
+                np.isfinite(assigned[k])
+            ):
+                cv2.circle(
+                    image,
+                    (
+                        int(xs[j]),
+                        round(float(assigned[k, j])),
+                    ),
+                    3,
+                    color,
+                    1,
+                )
+
+    draw_frame(image, bounds)
+    return image
+
+
+def process_page(
+    image_path,
+    segment,
+    args,
+    requested_count,
+    shape_weight,
+    anchors=None,
+):
+    def diagnostic(name):
+        return (
+            args.diagnostic_dir
+            / f"{image_path.stem}_{name}.png"
+        )
+
+    gray = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_GRAYSCALE,
+    )
+    if gray is None:
+        raise ValueError(
+            f"Cannot read {image_path}"
+        )
+
+    ink = binary_image(gray)
+    audit = (
+        {} if args.diagnostics else None
+    )
+    bounds = detect_frame(
+        ink,
+        audit,
+    )
+
+    if audit is not None:
+        save(
+            diagnostic("frame_detection"),
+            frame_detection_preview(gray, audit),
+        )
+    if bounds is None:
+        raise ValueError(
+            f"{image_path.name}: no plotting frame."
+        )
+
+    original = read_words(gray)
+    right_region = clip((
+        bounds[2] + 1,
+        bounds[1] - AXIS_SEARCH_PADDING,
+        gray.shape[1],
+        bounds[3] + AXIS_SEARCH_PADDING,
+    ), gray.shape)
+
+    raw = unique_words(
+        [
+            word for word in original
+            if in_right_region(word, bounds)
+        ]
+        + ocr_region_words(
+            gray,
+            right_region,
+        )
+    )
+
+    (
+        x0,
+        x1,
+        height,
+        right_anchors,
+    ) = find_numeric_column(
+        raw,
+        bounds,
+        gray.shape[1],
+    )
+    column = (
+        x0,
+        x1,
+        height,
+    )
+    top_anchor = right_anchors[0]
+    top_band = clip((
+        bounds[2] + 1,
+        top_anchor.top - height,
+        gray.shape[1],
+        top_anchor.bottom + height,
+    ), gray.shape)
+    title = detect_title_box(
+        gray,
+        bounds,
+        top_band,
+    )
+    axis_gray = gray.copy()
+
+    if title:
+        tx0, ty0, tx1, ty1 = title
+        axis_gray[
+            ty0:ty1,
+            tx0:tx1,
+        ] = 255
+
+        bx0, by0, bx1, by1 = top_band
+        axis_gray[
+            by0:by1,
+            bx0:bx1,
+        ] = gray[
+            by0:by1,
+            bx0:bx1,
+        ]
+
+        if (
+            max(w.right for w in right_anchors)
+            <= title[0] < x1
+        ):
+            column = (
+                x0,
+                title[0],
+                height,
+            )
+
+    rows = propose_rows(
+        raw,
+        bounds,
+        column,
+        right_anchors,
+    )
+    right = consistent_sequence(
+        read_label_rows(
+            axis_gray,
+            rows,
+            column,
+            right_anchors,
+        ),
+        False,
+    )
+    bottom = select_bottom(
+        original,
+        bounds,
+    )
+    bottom = recover_bottom_labels(
+        gray,
+        bottom,
+        right,
+        bounds,
+    )
+
+    base = (
+        cv2.cvtColor(
+            gray,
+            cv2.COLOR_GRAY2BGR,
+        )
+        if args.diagnostics else None
+    )
+
+    if base is not None:
+        save(
+            diagnostic("labels"),
+            label_preview(
+                base,
+                bounds,
+                bottom,
+                right,
+                title,
+                top_band,
+            ),
+        )
+
+    if (
+        len(bottom) < MIN_AXIS_LABELS
+        or len(right) < MIN_AXIS_LABELS
+    ):
+        raise ValueError(
+            f"{image_path.name}: insufficient labels "
+            f"({len(bottom)} bottom, {len(right)} right)."
+        )
+
+    x_fit = fit_axis(
+        bottom,
+        True,
+    )
+    multiplier = (
+        10.0 ** args.right_exponent
+    )
+    y_fit = fit_axis(
+        right,
+        False,
+        multiplier,
+    )
+    grid, references = generate_grid(
+        ink,
+        bounds,
+        bottom,
+        right,
+        args.grid_search,
+        args.straight_grid,
+    )
+
+    left, top, end, bottom_y = bounds
+    inside = np.zeros(
+        ink.shape,
+        bool,
+    )
+    inside[
+        top:bottom_y + 1,
+        left:end + 1,
+    ] = True
+    clean = (
+        ink & ~grid.mask & inside
+    )
+
+    if base is not None:
+        save(
+            diagnostic("grid_fit"),
+            grid_fit_preview(
+                base,
+                bounds,
+                grid,
+                references,
+            ),
+        )
+        grid_overlay = tint(
+            base,
+            grid.mask,
+            (0, 180, 0),
+        )
+        draw_frame(
+            grid_overlay,
+            bounds,
+        )
+        save(
+            diagnostic("grid_overlay"),
+            grid_overlay,
+        )
+        save(
+            diagnostic("clean"),
+            np.where(
+                clean,
+                0,
+                255,
+            ).astype(np.uint8),
+        )
+
+        if segment == "high" and anchors:
+            join_pixel = pixel_for_numerical_x(
+                bounds,
+                x_fit,
+                JOIN_X,
+            )
+            print(
+                f"{image_path.name}: calibrated x=1 is "
+                f"{join_pixel - left:.2f} px from the left frame."
+            )
+
+    def save_candidate(
+        xs,
+        assigned,
+        basis,
+        coefficients,
+        tags,
+        support,
+        status,
+    ):
+        if base is None:
+            return
+
+        for name in (
+            "fits",
+            "assignments",
+            "support",
+        ):
+            image = candidate_preview(
+                base,
+                bounds,
+                xs,
+                assigned,
+                basis,
+                coefficients,
+                tags,
+                support,
+                name,
+            )
+            detail = status
+
+            if name == "support":
+                detail += (
+                    " | Green=near cleaned ink; red=unsupported; "
+                    "orange=grid-obscured; gray=full candidate"
+                )
+            elif name == "assignments":
+                detail += (
+                    " | Circles=assigned observations"
+                )
+
+            save(
+                diagnostic(name),
+                diagnostic_banner(image, detail),
+            )
+
+    model = fit_curve_family(
+        clean,
+        grid.mask,
+        bounds,
+        requested_count,
+        shape_weight,
+        segment == "high",
+        x_fit,
+        y_fit,
+        grid.reference.major_x,
+        args.ink_weight,
+        args.join_mismatch * multiplier,
+        anchors,
+        save_candidate if base is not None else None,
+    )
+
+    if base is not None:
+        overlay = base.copy()
+
+        # Display-only: use actual tags instead of curve count.
+        colors = curve_colors(model.tags)
+
+        left_values = evaluate_family(
+            bounds,
+            model.basis,
+            model.coefficients,
+            np.array([float(left)]),
+        )[:, 0]
+
+        for index, (tag, path) in enumerate(zip(
+            model.tags,
+            model.paths,
+        )):
+            color = colors[index]
+            draw_fitted_path(
+                overlay,
+                path,
+                color,
+            )
+
+            if segment == "high" and anchors:
+                marker_x = left
+                marker_y = float(
+                    left_values[index]
+                )
+            else:
+                marker_x = model.seed_x
+                marker_y = float(
+                    model.seed_ys[index]
+                )
+
+            if top <= marker_y <= bottom_y:
+                cv2.circle(
+                    overlay,
+                    (marker_x, round(marker_y)),
+                    4,
+                    color,
+                    -1,
+                )
+                cv2.putText(
+                    overlay,
+                    tag,
+                    (marker_x + 7, round(marker_y) - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        draw_frame(overlay, bounds)
+        save(
+            diagnostic("fits"),
+            diagnostic_banner(
+                overlay,
+                "ACCEPTED FIT | Gray=unsupported estimates; "
+                "right tails are not projected",
+            ),
+        )
+
+        reference = grid.reference
+        print(
+            f"{image_path.name}: major spans "
+            f"{reference.intervals_x}/"
+            f"{reference.intervals_y:g}; "
+            f"{model.basis_count} coefficients/curve; "
+            f"shape weight {shape_weight:g}."
+        )
+
+        if model.guidance is not None:
+            print(
+                f"{image_path.name}: local join estimates found for "
+                f"{len(model.guidance.local_indices)}/"
+                f"{len(model.tags)} curves."
+            )
+
+    return PageResult(
+        image_path,
+        segment,
+        bounds,
+        x_fit,
+        y_fit,
+        model,
+    )
+
+
+def model_at_join(page, tag):
+    pixel_x = pixel_for_numerical_x(
+        page.bounds,
+        page.x_fit,
+        JOIN_X,
+    )
+    index = page.model.tags.index(tag)
+    pixel_y = float(evaluate_family(
+        page.bounds,
+        page.model.basis,
+        page.model.coefficients,
+        np.array([pixel_x]),
+        extrapolate=True,
+    )[index, 0])
+    numerical_y = float(
+        page.y_fit[0] * pixel_y
+        + page.y_fit[1]
+    )
+
+    observed_points = [
+        point
+        for point in page.model.paths[index]
+        if point[2]
+    ]
+    distance = (
+        min(
+            abs(point[0] - pixel_x)
+            for point in observed_points
+        )
+        if observed_points else float("inf")
+    )
+    supported = (
+        distance <= JOIN_PIXEL_TOLERANCE
+    )
+
+    return (
+        numerical_y,
+        pixel_x,
+        pixel_y,
+        supported,
+        distance,
+    )
+
+
+def make_join_anchors(low_page):
+    anchors = []
+
+    for value in range(1, 8):
+        tag = str(value)
+        (
+            y,
+            _,
+            _,
+            supported,
+            distance,
+        ) = model_at_join(
+            low_page,
+            tag,
+        )
+
+        inflation = min(
+            5.0,
+            1.0 + distance / 20.0,
+        )
+        sigma = (
+            JOIN_PIXEL_TOLERANCE
+            * abs(low_page.y_fit[0])
+            * inflation
+        )
+        anchors.append(JoinAnchor(
+            tag,
+            y,
+            max(sigma, 1e-15),
+            supported,
+        ))
+
+    return anchors
+
+
+def collect_rows(pages, paired):
+    rows = []
+
+    for page in pages:
+        for tag, path in zip(
+            page.model.tags,
+            page.model.paths,
+        ):
+            for px, py, observed, kind in path:
+                x = float(
+                    page.x_fit[0] * px
+                    + page.x_fit[1]
+                )
+                y = float(
+                    page.y_fit[0] * py
+                    + page.y_fit[1]
+                )
+
+                if paired:
+                    if (
+                        page.segment == "low"
+                        and x > JOIN_X
+                    ):
+                        continue
+                    if (
+                        page.segment == "high"
+                        and x < JOIN_X
+                    ):
+                        continue
+                    if abs(x - JOIN_X) < 1e-10:
+                        continue
+
+                rows.append((
+                    tag,
+                    x,
+                    y,
+                    px,
+                    py,
+                    int(observed),
+                    page.image.name,
+                    page.segment,
+                    kind,
+                ))
+
+    if paired:
+        for page in pages:
+            for tag, path in zip(
+                page.model.tags,
+                page.model.paths,
+            ):
+                if page.segment == "high":
+                    if (
+                        not path
+                        or path[0][0]
+                        > page.bounds[0] + 0.5
+                    ):
+                        continue
+
+                (
+                    y,
+                    px,
+                    py,
+                    supported,
+                    _,
+                ) = model_at_join(
+                    page,
+                    tag,
+                )
+                if not (
+                    page.bounds[1]
+                    <= py
+                    <= page.bounds[3]
+                ):
+                    continue
+
+                rows.append((
+                    tag,
+                    JOIN_X,
+                    y,
+                    px,
+                    py,
+                    int(supported),
+                    page.image.name,
+                    page.segment,
+                    (
+                        "image_supported"
+                        if supported
+                        else "join_projected"
+                    ),
+                ))
+
+    rows.sort(
+        key=lambda row: (
+            -float(row[0]),
+            row[1],
+            row[7],
+        )
+    )
+    return rows
+
+
+def write_points(path, rows):
+    temporary = path.with_name(
+        path.name + ".tmp"
+    )
+
+    try:
+        with temporary.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow((
+                "curve",
+                "x",
+                "y",
+                "pixel_x",
+                "pixel_y",
+                "observed",
+                "source_image",
+                "segment",
+                "estimate_kind",
+            ))
+
+            for (
+                tag,
+                x,
+                y,
+                px,
+                py,
+                observed,
+                source,
+                segment,
+                kind,
+            ) in rows:
+                writer.writerow((
+                    tag,
+                    f"{x:.10g}",
+                    f"{y:.10g}",
+                    f"{px:.3f}",
+                    f"{py:.3f}",
+                    observed,
+                    source,
+                    segment,
+                    kind,
+                ))
+
+        temporary.replace(path)
+    finally:
+        temporary.unlink(
+            missing_ok=True
+        )
+
+
+def write_join_audit(path, low, high, anchors):
+    temporary = path.with_name(
+        path.name + ".tmp"
+    )
+    by_tag = {
+        anchor.tag: anchor for anchor in anchors
+    }
+    guidance = high.model.guidance
+
+    local_values = {}
+    if guidance is not None:
+        _, top, _, bottom = high.bounds
+        height = bottom - top
+
+        for position, index in enumerate(
+            guidance.local_indices
+        ):
+            pixel_y = (
+                top
+                + height
+                * guidance.local_targets[position]
+            )
+            local_values[
+                high.model.tags[index]
+            ] = float(
+                high.y_fit[0] * pixel_y
+                + high.y_fit[1]
+            )
+
+    try:
+        with temporary.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow((
+                "curve",
+                "x",
+                "low_y",
+                "high_fitted_y",
+                "high_minus_low",
+                "high_local_join_y",
+                "low_anchor_sigma",
+                "low_image_supported",
+                "high_image_supported",
+                "low_source",
+                "high_source",
+            ))
+
+            for tag in high.model.tags:
+                (
+                    high_y,
+                    _,
+                    _,
+                    supported,
+                    _,
+                ) = model_at_join(
+                    high,
+                    tag,
+                )
+                value = float(tag)
+                local = local_values.get(tag)
+
+                if value.is_integer():
+                    anchor = by_tag[
+                        str(int(value))
+                    ]
+                    low_y = f"{anchor.value:.10g}"
+                    difference = (
+                        f"{high_y - anchor.value:.10g}"
+                    )
+                    sigma = f"{anchor.sigma:.10g}"
+                    low_supported = int(
+                        anchor.low_supported
+                    )
+                else:
+                    low_y = ""
+                    difference = ""
+                    sigma = ""
+                    low_supported = ""
+
+                writer.writerow((
+                    tag,
+                    f"{JOIN_X:g}",
+                    low_y,
+                    f"{high_y:.10g}",
+                    difference,
+                    (
+                        ""
+                        if local is None
+                        else f"{local:.10g}"
+                    ),
+                    sigma,
+                    low_supported,
+                    int(supported),
+                    low.image.name,
+                    high.image.name,
+                ))
+
+        temporary.replace(path)
+    finally:
+        temporary.unlink(
+            missing_ok=True
+        )
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("points.csv"))
+    parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--overlay", type=Path, default=Path("diagnostics.png")
+        "images",
+        nargs="*",
+        type=Path,
+        help="One image, or low-speed followed by high-speed image.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+    )
+    parser.add_argument(
+        "--right-exponent",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--curve-count",
+        type=int,
+        choices=(7, 12),
+        help="Single-image mode only.",
+    )
+    parser.add_argument(
+        "--high-speed",
+        action="store_true",
+        help="Treat one input as a high-speed segment.",
+    )
+    parser.add_argument(
+        "--shape-weight",
+        type=float,
+        default=DEFAULT_SHAPE_WEIGHT,
+        help="Low-speed/single ordinary image slope coupling.",
+    )
+    parser.add_argument(
+        "--high-shape-weight",
+        type=float,
+        default=0.0,
+        help="High-speed slope coupling; default disabled.",
+    )
+    parser.add_argument(
+        "--ink-weight",
+        type=float,
+        default=DEFAULT_INK_WEIGHT,
+        help="High-speed direct cleaned-ink distance penalty.",
+    )
+    parser.add_argument(
+        "--join-mismatch",
+        type=float,
+        default=DEFAULT_JOIN_MISMATCH,
+        help=(
+            "Printed-data mismatch allowance in displayed right-axis "
+            "units, before applying --right-exponent."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--diagnostic-dir",
+        type=Path,
+        default=DEFAULT_DIAGNOSTIC_DIR,
+    )
+    parser.add_argument(
+        "--grid-search",
+        type=float,
+        default=DEFAULT_GRID_SEARCH,
+    )
+    parser.add_argument(
+        "--straight-grid",
+        action="store_true",
     )
     args = parser.parse_args()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.overlay.parent.mkdir(parents=True, exist_ok=True)
+    images = (
+        args.images or [DEFAULT_IMAGE]
+    )
+    if len(images) not in (1, 2):
+        raise ValueError(
+            "Provide one image or exactly two paired images."
+        )
 
-    directory, stem = args.overlay.parent, args.overlay.stem
-    report_path = args.overlay.with_suffix(".json")
-    grid_path = directory / f"{stem}_grid.png"
-    expected_path = directory / f"{stem}_expected_grid.png"
-    expected_overlay_path = directory / f"{stem}_expected_overlay.png"
+    paired = len(images) == 2
+    if paired and (
+        args.high_speed
+        or args.curve_count is not None
+    ):
+        raise ValueError(
+            "Paired mode uses low=7 and high=12 curves. "
+            "Do not supply --high-speed or --curve-count."
+        )
 
-    report = {
-        "image": str(args.image),
-        "warnings": [
-            "Experimental: inspect diagnostics before trusting CSV values.",
-            "Spacing and rotation are estimated from the right half.",
-            "One global square grid is assumed.",
-            "No local geometric dewarping.",
-            "Detached scientific-notation multipliers are not parsed.",
-            "Axis calibration uses original-image coordinates.",
-        ],
-        "panels": [],
-        "errors": [],
-    }
+    if (
+        len({
+            image.resolve() for image in images
+        }) != len(images)
+    ):
+        raise ValueError(
+            "Input images must be distinct."
+        )
 
-    overlay = None
-    rows = []
-    failed = False
-    colors = [
-        (255, 100, 0), (0, 150, 0), (180, 0, 180),
-        (0, 130, 255), (180, 100, 40), (130, 130, 0),
+    if not -100 <= args.right_exponent <= 100:
+        raise ValueError(
+            "Right exponent must be between -100 and 100."
+        )
+
+    for name, value in (
+        ("shape-weight", args.shape_weight),
+        ("high-shape-weight", args.high_shape_weight),
+        ("ink-weight", args.ink_weight),
+        ("join-mismatch", args.join_mismatch),
+    ):
+        if (
+            not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                f"--{name} must be finite and nonnegative."
+            )
+
+    if (
+        not math.isfinite(args.grid_search)
+        or args.grid_search <= 0
+    ):
+        raise ValueError(
+            "--grid-search must be positive and finite."
+        )
+
+    default_stem = "_".join(
+        image.stem for image in images
+    )
+    output = (
+        args.output
+        or DEFAULT_OUTPUT_DIR
+        / f"{default_stem}_points.csv"
+    )
+    join_output = output.with_name(
+        output.stem + "_join.csv"
+    )
+
+    generated = [
+        output,
+        output.with_name(
+            output.name + ".tmp"
+        ),
+    ]
+    if paired:
+        generated += [
+            join_output,
+            join_output.with_name(
+                join_output.name + ".tmp"
+            ),
+        ]
+
+    if args.diagnostics:
+        for image in images:
+            generated += [
+                args.diagnostic_dir
+                / f"{image.stem}_{name}.png"
+                for name in (
+                    "frame_detection",
+                    "labels",
+                    "grid_fit",
+                    "grid_overlay",
+                    "clean",
+                    "fits",
+                    "assignments",
+                    "support",
+                )
+            ]
+
+    resolved = [
+        path.resolve() for path in generated
     ]
 
-    try:
-        gray = read_image(args.image)
-        ink = binarize(gray)
-        base = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        overlay = base.copy()
-
-        print("Fitting grid using the right-hand section...")
-        mask, tracks, model = make_grid_mask(ink)
-        report["grid_model"] = model
-
-        print(
-            f"Measured adjacent spacing: "
-            f"{model['mean_adjacent_spacing']:.3f} px "
-            f"(SD {model['adjacent_spacing_std']:.3f} px)"
-        )
-        print(
-            f"Fitted spacing: {model['spacing']:.3f} px; "
-            f"rotation: {model['alignment_angle_degrees']:.3f} degrees"
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            "Generated paths collide; use distinct image stems "
+            "or another output/diagnostic directory."
         )
 
-        expected = render_expected_grid(ink.shape, model)
-        cv2.imwrite(str(expected_path), expected)
-        cv2.imwrite(
-            str(expected_overlay_path),
-            tint_mask(base, expected > 0, (0, 180, 0)),
+    if any(
+        image.resolve() in resolved
+        for image in images
+    ):
+        raise ValueError(
+            "An output path would overwrite an input."
         )
-        cv2.imwrite(str(grid_path), mask.astype(np.uint8) * 255)
 
-        overlay = tint_mask(base, mask, (0, 0, 255), opacity=0.60)
-        cv2.imwrite(str(args.overlay), overlay)
-
-        if not tracks:
+    for image in images:
+        if not image.is_file():
             raise ValueError(
-                "Grid fitted, but no sufficiently long supported "
-                "line sections were found."
+                f"Input does not exist: {image}"
             )
 
-        panels = detect_panels(mask, tracks)
-        for index, panel in enumerate(panels):
-            report["panels"].append({
-                "panel": index + 1,
-                "bounds": [
-                    panel.left, panel.top, panel.right, panel.bottom
-                ],
-                "warnings": [],
-            })
-            cv2.rectangle(
-                overlay,
-                (panel.left, panel.top),
-                (panel.right, panel.bottom),
-                (255, 180, 0),
-                2,
-            )
-            cv2.putText(
-                overlay,
-                f"Panel {index + 1}",
-                (panel.left + 8, panel.top + 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 180, 0),
-                2,
-            )
-        cv2.imwrite(str(args.overlay), overlay)
+    output.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-        if len(panels) != 2:
-            report["warnings"].append(
-                f"Detected {len(panels)} section(s), not two. "
-                "Curve counts will be inferred where possible."
-            )
+    for path in generated:
+        path.unlink(
+            missing_ok=True
+        )
 
-        print("Reading labels with Tesseract...")
-        report["tesseract"] = configure_tesseract()
-        words = read_words(gray)
-        report["ocr_words"] = [
-            {
-                "text": word.text,
-                "confidence": word.confidence,
-                "box": [
-                    word.left, word.top, word.width, word.height
-                ],
-            }
-            for word in words
+    if not find_tesseract():
+        raise ValueError(
+            "Tesseract not found."
+        )
+
+    if paired:
+        low = process_page(
+            images[0],
+            "low",
+            args,
+            requested_count=7,
+            shape_weight=args.shape_weight,
+        )
+        anchors = make_join_anchors(low)
+        high = process_page(
+            images[1],
+            "high",
+            args,
+            requested_count=12,
+            shape_weight=args.high_shape_weight,
+            anchors=anchors,
+        )
+        pages = [
+            low,
+            high,
         ]
-        clean = tracing_ink(ink, mask, words)
+    else:
+        high_speed = args.high_speed
+        requested_count = args.curve_count
+        if high_speed and requested_count is None:
+            requested_count = 12
 
-        for index, panel in enumerate(panels):
-            info = report["panels"][index]
-            try:
-                expected_count = (
-                    (7 if index == 0 else 12)
-                    if len(panels) == 2 else None
-                )
-                seed_x, seed_ys = choose_seeds(
-                    clean, panel, expected_count
-                )
+        page = process_page(
+            images[0],
+            "high" if high_speed else "single",
+            args,
+            requested_count=requested_count,
+            shape_weight=(
+                args.high_shape_weight
+                if high_speed
+                else args.shape_weight
+            ),
+        )
+        pages = [page]
+        anchors = []
 
-                tags = (
-                    [str(v) for v in range(7, 0, -1)]
-                    if len(seed_ys) == 7
-                    else [f"{6.5 - 0.5 * i:g}" for i in range(12)]
-                )
-
-                info["tags"] = tags
-                info["seed_x"] = int(seed_x)
-                info["seed_ys"] = [float(y) for y in seed_ys]
-                traces = []
-
-                for curve_index, (tag, seed_y) in enumerate(
-                    zip(tags, seed_ys)
-                ):
-                    path = trace_curve(clean, panel, seed_x, seed_y)
-                    traces.append((tag, path))
-                    color = colors[curve_index % len(colors)]
-                    points = np.rint(
-                        [[x, y] for x, y, _ in path]
-                    ).astype(np.int32)
-
-                    if len(points) > 1:
-                        cv2.polylines(
-                            overlay, [points], False, color, 2
-                        )
-                    cv2.circle(
-                        overlay,
-                        (seed_x, int(round(seed_y))),
-                        5,
-                        color,
-                        -1,
-                    )
-                    cv2.putText(
-                        overlay,
-                        tag,
-                        (seed_x + 8, int(round(seed_y)) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-                    coverage = len(path) / max(
-                        1, panel.right - panel.left + 1
-                    )
-                    observed_fraction = sum(
-                        observed for _, _, observed in path
-                    ) / max(1, len(path))
-
-                    info.setdefault("curves", []).append({
-                        "tag": tag,
-                        "coverage": float(coverage),
-                        "observed_fraction": float(observed_fraction),
-                    })
-                    if coverage < 0.60:
-                        info["warnings"].append(
-                            f"Curve {tag}: only {coverage:.0%} coverage."
-                        )
-
-                validate_order(traces)
-                x_fit, y_fit = calibrate(panel, words)
-                info["x_calibration"] = x_fit
-                info["y_calibration"] = y_fit
-
-                for tag, path in traces:
-                    for px, py, observed in path:
-                        rows.append({
-                            "panel": index + 1,
-                            "curve": tag,
-                            "x": x_fit["a"] * px + x_fit["b"],
-                            "y": y_fit["a"] * py + y_fit["b"],
-                            "pixel_x": px,
-                            "pixel_y": py,
-                            "observed": int(observed),
-                        })
-
-            except ValueError as error:
-                failed = True
-                info["error"] = str(error)
-
-    except Exception as error:
-        failed = True
-        report["errors"].append(f"{type(error).__name__}: {error}")
-        report["traceback"] = traceback.format_exc()
-        traceback.print_exc()
-
-    finally:
-        if overlay is not None:
-            cv2.imwrite(str(args.overlay), overlay)
-        report_path.write_text(
-            json.dumps(report, indent=2), encoding="utf-8"
+    rows = collect_rows(
+        pages,
+        paired,
+    )
+    if not rows:
+        raise ValueError(
+            "No fitted points available for export."
         )
 
-    print(f"Expected grid: {expected_path}")
-    print(f"Expected-grid overlay: {expected_overlay_path}")
-    print(f"Final mask: {grid_path}")
-    print(f"Diagnostic overlay: {args.overlay}")
-    print(f"Report: {report_path}")
+    if paired:
+        write_join_audit(
+            join_output,
+            pages[0],
+            pages[1],
+            anchors,
+        )
 
-    if failed or not rows:
+    write_points(
+        output,
+        rows,
+    )
+    print(
+        f"Wrote {output} "
+        f"({len(rows)} fitted points)."
+    )
+    if paired:
         print(
-            "No new CSV written. Inspect the report and diagnostics.",
-            file=sys.stderr,
+            f"Wrote {join_output}."
         )
-        if args.output.exists():
-            print(
-                f"Existing CSV was not updated: {args.output}",
-                file=sys.stderr,
-            )
-        return 1
 
-    with args.output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "panel", "curve", "x", "y",
-                "pixel_x", "pixel_y", "observed",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({
-                **row,
-                "x": f"{row['x']:.10g}",
-                "y": f"{row['y']:.10g}",
-                "pixel_y": f"{row['pixel_y']:.3f}",
-            })
-
-    print(f"Wrote {len(rows)} points to {args.output}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        sys.exit(main())
+    except (
+        OSError,
+        ValueError,
+        cv2.error,
+        pytesseract.TesseractError,
+    ) as error:
+        print(
+            f"Extraction failed: {error}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
