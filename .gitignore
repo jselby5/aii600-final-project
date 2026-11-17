@@ -13,6 +13,7 @@ data/*
 !scripts/extract_graph.py
 !scripts/requirements.txt
 
+*.csv
 *.pt
 *.pth
 *.ckpt
